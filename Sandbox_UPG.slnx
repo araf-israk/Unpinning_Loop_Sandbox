@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="Sandbox_UPG.vcxproj" Id="8216eb47-44ac-4958-b13e-0ac28bbd6cb5" />
+</Solution>

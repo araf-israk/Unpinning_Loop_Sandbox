@@ -1,0 +1,22 @@
+# Visual Studio / Windows
+.vs/
+Debug/
+Release/
+x64/
+*.pdb
+*.ipch
+*.obj
+*.exe
+*.ilk
+
+# macOS / Linux (Makefile artifacts)
+.DS_Store
+*.o
+*.out
+*.so
+*.dylib
+*.a
+
+# Raylib / General Build Directories
+build/
+bin/
