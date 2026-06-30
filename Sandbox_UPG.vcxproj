@@ -127,18 +127,28 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="regions.cpp" />
-    <ClCompile Include="Sandbox_UPG.cpp" />
-    <ClCompile Include="sigma_import.cpp" />
-    <ClCompile Include="upg.cpp" />
-  </ItemGroup>
-  <ItemGroup>
     <None Include="packages.config" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="multiloop.h" />
+    <ClInclude Include="orthogonal.h" />
+    <ClInclude Include="permutation.h" />
     <ClInclude Include="regions.h" />
     <ClInclude Include="sigma_import.h" />
     <ClInclude Include="upg.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="multiloop.cpp" />
+    <ClCompile Include="orthogonal.cpp" />
+    <ClCompile Include="permutation.cpp" />
+    <ClCompile Include="regions.cpp" />
+    <ClCompile Include="Sandbox_UPG.cpp" />
+    <ClCompile Include="sigma_import.cpp" />
+    <ClCompile Include="upg_build.cpp" />
+    <ClCompile Include="upg_faces.cpp" />
+    <ClCompile Include="upg_moves.cpp" />
+    <ClCompile Include="upg_render.cpp" />
+    <ClCompile Include="upg_surgery.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

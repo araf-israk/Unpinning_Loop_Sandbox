@@ -26,7 +26,10 @@
 // ============================================================================
 
 #include "upg.h"
+#include "multiloop.h"     // Multiloop, ValidateMultiloopSigma
+#include "orthogonal.h"    // GridLayout, GridPoint, ComputeGridLayout
 #include <array>
+#include <string>
 
 // Build a LoopModel from sigma. `sigma[v]` is the rotational 4-cycle of vertex
 // v; `crossingGrid[v]` is that vertex's position in grid-cell coordinates.
@@ -92,3 +95,28 @@ inline std::vector<Vector2> LooPindex_10_1_18_GridPoints() {
 // interior, even for non-convex regions). The unbounded outer region gets none.
 // Clears existing pins. SettlePins then relaxes each to its region's open centre.
 int SeedPinsFromCells(LoopModel& m);
+// ============================================================================
+// Orthogonal-layout builder (folded in from the former sigma_to_grid / sigma_ortho
+// glue). This is the rectilinear alternative to BuildLoopFromSigma + TutteLayout:
+// it lays sigma out with the bend-minimised orthogonal engine (orthogonal.h) and
+// feeds the resulting integer rectilinear polygon through BuildLoopFromPolygon,
+// so the rendered game matches a real orthogonal drawing.
+// ============================================================================
+
+// Walk the multiloop's single strand (rho order) and stitch the orthogonal edge
+// polylines into ONE closed rectilinear traversal in which every crossing
+// appears exactly twice (the "doubled vertex" form BuildLoopFromPolygon wants).
+// Edge orientation is decided geometrically, so it is independent of the
+// dart-sign convention. Throws if the diagram is not a single component.
+std::vector<GridPoint> SigmaGridPolygon(const Multiloop& loop,
+                                        const GridLayout& layout,
+                                        int startEdge = 1);
+
+// Validate sigma, lay it out orthogonally (exteriorFace = -1 picks the largest
+// face as the infinite region), and build the necklace. Throws on failure.
+LoopModel BuildLoopFromSigmaOrthogonal(const Permutation& sigma, int exteriorFace = -1);
+
+// Menu convenience: parse cycle notation like "(16,5,-1,-6)(12,1,-13,-2)..." and
+// build the model. On failure fills `errorOut` (human-readable) instead of
+// throwing and returns an empty model, so the UI can show the message.
+LoopModel BuildLoopFromSigmaString(const std::string& cycleNotation, std::string& errorOut);

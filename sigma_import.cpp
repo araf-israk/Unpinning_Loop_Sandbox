@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cassert>
+#include <stdexcept>
 
 // Number of interior edge beads for a grid-space segment of the given length,
 // spaced at the physics rest length; at least one so every slot links a bead.
@@ -274,4 +275,122 @@ std::vector<Vector2> TutteLayout(const std::vector<std::array<int, 4>>& sigma,
         out[v] = { centerGrid.x + radiusGrid * pos[v].x,
                    centerGrid.y + radiusGrid * pos[v].y };
     return out;
+}
+// ============================================================================
+// Orthogonal-layout builder (folded in from sigma_to_grid.cpp + upg_sigma_ortho.cpp).
+//   sigma -> Multiloop (validate) -> ComputeGridLayout -> SigmaGridPolygon
+//   -> BuildLoopFromPolygon -> LoopModel
+// ============================================================================
+
+namespace {
+    inline bool SamePt(const GridPoint& a, const GridPoint& b) { return a.x == b.x && a.y == b.y; }
+}
+
+std::vector<GridPoint> SigmaGridPolygon(const Multiloop& loop,
+                                        const GridLayout& layout,
+                                        int startEdge) {
+    if (loop.numStrands != 1)
+        throw std::runtime_error("SigmaGridPolygon: diagram has multiple components; "
+                                 "BuildLoopFromPolygon takes a single closed polygon");
+
+    // 1. Edge order along the strand: walk rho (straight-ahead) once around.
+    std::vector<int> edgeOrder;
+    {
+        int start = startEdge, h = start, guard = 0;
+        do { edgeOrder.push_back(std::abs(h)); h = loop.rho.Apply(h); }
+        while (h != start && ++guard < 4 * loop.numEdges + 8);
+    }
+    if ((int)edgeOrder.size() != loop.numEdges)
+        throw std::runtime_error("SigmaGridPolygon: strand did not cover every edge once");
+
+    auto endpoints = [&](int k, GridPoint& a, GridPoint& b) {
+        const std::vector<GridPoint>& p = layout.edgePaths.at(k - 1);
+        a = p.front(); b = p.back();
+        };
+
+    // 2. Starting pen = the crossing shared by the last and first edges.
+    GridPoint penPos;
+    {
+        GridPoint a0, b0, aL, bL;
+        endpoints(edgeOrder.front(), a0, b0);
+        endpoints(edgeOrder.back(), aL, bL);
+        if      (SamePt(a0, aL) || SamePt(a0, bL)) penPos = a0;
+        else if (SamePt(b0, aL) || SamePt(b0, bL)) penPos = b0;
+        else throw std::runtime_error("SigmaGridPolygon: first/last edges are not adjacent");
+    }
+
+    // 3. Stitch, orienting each edge so it starts at the pen (geometry decides
+    //    direction, so a path stored either way is handled).
+    std::vector<GridPoint> poly;
+    auto append = [&](const GridPoint& q) {
+        if (poly.empty() || !SamePt(poly.back(), q)) poly.push_back(q);
+        };
+    for (int k : edgeOrder) {
+        const std::vector<GridPoint>& path = layout.edgePaths.at(k - 1);
+        if (SamePt(path.front(), penPos)) {
+            for (const GridPoint& q : path) append(q);
+            penPos = path.back();
+        }
+        else if (SamePt(path.back(), penPos)) {
+            for (auto it = path.rbegin(); it != path.rend(); ++it) append(*it);
+            penPos = path.front();
+        }
+        else {
+            throw std::runtime_error("SigmaGridPolygon: edge does not continue from pen "
+                                     "(discontinuous strand or bad layout)");
+        }
+    }
+    // 4. Drop the wrap-around duplicate (front repeated as back).
+    if (poly.size() >= 2 && SamePt(poly.front(), poly.back())) poly.pop_back();
+    return poly;
+}
+
+LoopModel BuildLoopFromSigmaOrthogonal(const Permutation& sigma, int exteriorFace) {
+    const std::string err = ValidateMultiloopSigma(sigma);
+    if (!err.empty()) throw std::runtime_error(err);
+
+    Multiloop loop(sigma);
+
+    // Default exterior = the face bounded by the most half-edges (the outer
+    // boundary in a typical drawing); callers may override.
+    if (exteriorFace < 0) {
+        exteriorFace = 0;
+        size_t best = 0;
+        for (int f = 0; f < (int)loop.faces.size(); ++f)
+            if (loop.faces[f].size() > best) { best = loop.faces[f].size(); exteriorFace = f; }
+    }
+
+    GridLayout layout = ComputeGridLayout(loop, exteriorFace);
+    std::vector<GridPoint> gp = SigmaGridPolygon(loop, layout);
+
+    // Centre the integer drawing on the GRID_N board and flip y (orthogonal is
+    // y-up; UPG's canvas is y-down). Centring is cosmetic: the spring physics
+    // relaxes to rest-length spacing and re-centres the centroid, so a layout
+    // larger than GRID_N still builds correctly. Coords stay integers, so the
+    // crossing detection in BuildLoopFromPolygon (which rounds to int) is exact.
+    const float offX = (GRID_N - layout.width)  / 2.0f;
+    const float offY = (GRID_N - layout.height) / 2.0f;
+
+    std::vector<Vector2> pts;
+    pts.reserve(gp.size());
+    for (const GridPoint& p : gp)
+        pts.push_back({ (float)p.x + offX, (float)(layout.height - p.y) + offY });
+
+    // Empty pinCells: Init(LoopModel) seeds pins geometrically via ReconcilePins.
+    return BuildLoopFromPolygon(pts, {}, {});
+}
+
+LoopModel BuildLoopFromSigmaString(const std::string& cycleNotation, std::string& errorOut) {
+    errorOut.clear();
+    try {
+        Permutation sigma = Permutation::FromString(cycleNotation);
+        if (sigma.MaxAbsLabel() == 0)
+            throw std::runtime_error("no crossings parsed - enter cycles like "
+                                     "(16,5,-1,-6)(12,1,-13,-2)...");
+        return BuildLoopFromSigmaOrthogonal(sigma, -1);
+    }
+    catch (const std::exception& e) {
+        errorOut = e.what();
+        return LoopModel{};
+    }
 }

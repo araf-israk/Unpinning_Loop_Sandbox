@@ -7,7 +7,7 @@
 #include <cmath>
 #include <algorithm>
 
-// ---- small geometry helpers (local; upg.cpp's are file-private) -------------
+// ---- small geometry helpers (local; upg_faces.cpp's are file-private) -------
 
 static bool PtInPoly(Vector2 p, const std::vector<Vector2>& poly) {
     bool in = false; size_t n = poly.size();

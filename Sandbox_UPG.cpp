@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <unordered_map>
 
 static float Dist2(Vector2 a, Vector2 b) {
@@ -551,50 +552,153 @@ struct GameState {
 };
 
 // ============================================================================
+// START MENU
+//
+// A single text field for the vertex permutation sigma (cycle notation, e.g.
+// "(16,5,-1,-6)(12,1,-13,-2)...") plus a Start button. Start parses the string,
+// builds the model via the orthogonal-layout path (BuildLoopFromSigmaString),
+// and on success hands the LoopModel to the game; on failure it shows the
+// validator's message and stays on the menu. Enter also starts; Ctrl+V pastes.
+// ============================================================================
+
+struct StartMenu {
+    // Pre-filled with the 10_1_18 example so the user can just press Start.
+    std::string text =
+        "(16,5,-1,-6)(12,1,-13,-2)(7,2,-8,-3)(11,6,-12,-7)"
+        "(4,9,-5,-10)(15,10,-16,-11)(8,13,-9,-14)(3,14,-4,-15)";
+    std::string error;
+    float       backspaceTimer = 0.0f;
+
+    // Centred widgets.
+    Rectangle InputBox()  const { return { 150.0f, 470.0f, (float)SCREEN_WIDTH - 300.0f, 56.0f }; }
+    Rectangle StartBtn()  const { return { SCREEN_WIDTH / 2.0f - 100.0f, 560.0f, 200.0f, 56.0f }; }
+
+    // Returns true when Start (button or Enter) is pressed this frame.
+    bool Update(Vector2 mouse) {
+        // --- text entry ---
+        int c;
+        while ((c = GetCharPressed()) > 0)
+            if (c >= 32 && c < 127) text.push_back((char)c);   // printable ASCII only
+
+        // backspace with auto-repeat
+        if (IsKeyPressed(KEY_BACKSPACE)) {
+            if (!text.empty()) text.pop_back();
+            backspaceTimer = 0.4f;
+        }
+        else if (IsKeyDown(KEY_BACKSPACE)) {
+            backspaceTimer -= GetFrameTime();
+            if (backspaceTimer <= 0.0f) { if (!text.empty()) text.pop_back(); backspaceTimer = 0.04f; }
+        }
+
+        // paste (Ctrl/Cmd + V)
+        if ((IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) && IsKeyPressed(KEY_V)) {
+            const char* clip = GetClipboardText();
+            if (clip) text += clip;
+        }
+
+        // --- start triggers ---
+        bool start = IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER);
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mouse, StartBtn()))
+            start = true;
+        return start;
+    }
+
+    void Draw(Vector2 mouse) const {
+        BeginDrawing();
+        ClearBackground(BLACK);
+
+        const char* title = "THE UNPINNING GAME";
+        DrawText(title, SCREEN_WIDTH / 2 - MeasureText(title, 48) / 2, 250, 48, WHITE);
+        const char* sub = "Enter the vertex permutation sigma, then press Start.";
+        DrawText(sub, SCREEN_WIDTH / 2 - MeasureText(sub, 20) / 2, 330, 20, GRAY);
+        const char* ex = "e.g.  (16,5,-1,-6)(12,1,-13,-2)(7,2,-8,-3)(11,6,-12,-7) ...";
+        DrawText(ex, SCREEN_WIDTH / 2 - MeasureText(ex, 16) / 2, 360, 16, DARKGRAY);
+
+        // input box
+        Rectangle box = InputBox();
+        DrawRectangleRec(box, Fade(WHITE, 0.06f));
+        DrawRectangleLinesEx(box, 2.0f, Fade(WHITE, 0.6f));
+
+        const int   fs = 20, pad = 12;
+        const int   innerW = (int)box.width - 2 * pad;
+        const char* shown = text.empty()
+            ? "(type or paste cycles here)"
+            : text.c_str();
+        const Color shownColor = text.empty() ? DARKGRAY : WHITE;
+        const int   tw = MeasureText(text.c_str(), fs);
+        const int   scroll = (tw > innerW) ? (tw - innerW) : 0;   // keep the tail visible
+
+        BeginScissorMode((int)box.x + pad, (int)box.y, innerW, (int)box.height);
+        DrawText(shown, (int)box.x + pad - scroll, (int)box.y + ((int)box.height - fs) / 2, fs, shownColor);
+        EndScissorMode();
+
+        // blinking caret at the end of the (scrolled) text
+        if (((int)(GetTime() * 2.0)) % 2 == 0) {
+            int caretX = (int)box.x + pad - scroll + (text.empty() ? 0 : tw);
+            DrawRectangle(caretX, (int)box.y + 10, 2, (int)box.height - 20, WHITE);
+        }
+
+        // start button (hover highlight)
+        Rectangle btn = StartBtn();
+        bool hover = CheckCollisionPointRec(mouse, btn);
+        DrawRectangleRec(btn, hover ? BLUE : Fade(BLUE, 0.7f));
+        const char* bl = "START";
+        DrawText(bl, (int)(btn.x + btn.width / 2) - MeasureText(bl, 24) / 2,
+                 (int)(btn.y + btn.height / 2) - 12, 24, WHITE);
+
+        // error message
+        if (!error.empty()) {
+            std::string msg = "Could not start: " + error;
+            DrawText(msg.c_str(), SCREEN_WIDTH / 2 - MeasureText(msg.c_str(), 18) / 2, 650, 18, RED);
+        }
+
+        const char* foot = "Enter = Start    |    Ctrl+V = paste    |    Esc (in game) = back to menu";
+        DrawText(foot, SCREEN_WIDTH / 2 - MeasureText(foot, 14) / 2, SCREEN_HEIGHT - 40, 14, GRAY);
+        EndDrawing();
+    }
+};
+
+// ============================================================================
 // ENTRY POINT
 // ============================================================================
 
 #ifndef UPG_NO_MAIN
+enum class AppState { Menu, Playing };
+
 int main() {
     InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, "The Unpinning Game");
     SetTargetFPS(120);
 
+    AppState  state = AppState::Menu;
+    StartMenu menu;
     GameState gs;
 
-    // ---- Build the loop exactly as drawn on LooPindex. ----------------------
-    // 10^1_18 is a rectilinear grid polygon on the 6x6 grid; BuildLoopFromPolygon
-    // traces that curve (corners + crossings) so the game loop matches the
-    // annotated.svg layout. One pin is seeded per bounded region.
-    LoopModel m = BuildLoopFromPolygon(LooPindex_10_1_18_GridPoints(), {}, {});
-    gs.Init(std::move(m));
-
-    // ---- Alternative: build from the sigma permutation with a Tutte layout.
-    //      Topologically identical, but the arcs are straight crossing-to-
-    //      crossing rather than rectilinear, so it does not match the drawing.
-    // auto sigma = Sigma_10_1_18();
-    // LoopModel m = BuildLoopFromSigma(sigma, TutteLayout(sigma));
-    // BuildFacesFromPhi(m, sigma);
-    // SeedPinsPerFace(m, sigma);
-    // gs.Init(std::move(m));
-
-    // ---- Legacy hand-authored trefoil (original demo). ----------------------
-    // const std::vector<Vector2> gridPoints = {
-    //     {1, 0}, {0, 0}, {0, 1},
-    //     {1, 1}, {3, 1}, {4, 1}, {4, 0}, {3, 0},
-    //     {3, 1}, {3, 3}, {3, 4}, {4, 4}, {4, 3},
-    //     {3, 3}, {1, 3}, {1, 1}
-    // };
-    // const std::vector<Vector2> faceCoords = {
-    //     {0.5f, 0.5f}, {3.5f, 0.5f}, {3.5f, 3.5f}, {2.5f, 1.5f}
-    // };
-    // const std::vector<std::pair<int, int>> pinCells = {
-    //     {0, 0}, {3, 1}, {21, 2}, {8, 3}
-    // };
-    // gs.Init(gridPoints, faceCoords, pinCells);
-
     while (!WindowShouldClose()) {
-        gs.Update(GetMousePosition());
-        gs.Render();
+        Vector2 mouse = GetMousePosition();
+
+        if (state == AppState::Menu) {
+            if (menu.Update(mouse)) {
+                // Parse the sigma string and build the loop via the orthogonal
+                // layout. On success, start; on failure, surface the message.
+                std::string err;
+                LoopModel m = BuildLoopFromSigmaString(menu.text, err);
+                if (err.empty()) {
+                    gs = GameState{};          // fresh game
+                    gs.Init(std::move(m));
+                    menu.error.clear();
+                    state = AppState::Playing;
+                }
+                else {
+                    menu.error = err;
+                }
+            }
+            menu.Draw(mouse);
+        }
+        else { // Playing
+            if (IsKeyPressed(KEY_ESCAPE)) { state = AppState::Menu; continue; }
+            gs.Update(mouse);
+            gs.Render();
+        }
     }
 
     CloseWindow();

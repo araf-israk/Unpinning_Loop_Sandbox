@@ -12,6 +12,15 @@
 // removable bigon is two crossing-free arcs between the same two crossings -
 // both read straight off the links. Removal is local relinking (CollapseRegion)
 // plus a smooth rest-length collapse animation.
+//
+// This header declares the whole model; the implementation is split across:
+//   upg_build.cpp    coordinate utils, grid topology map, BuildLoopFromPolygon
+//   upg_surgery.cpp  link-rewiring primitives + dynamic resampling
+//   upg_faces.cpp    arc / face queries and ClassifyFace (R1/R2/R3 detection)
+//   upg_moves.cpp    the R1 / R2 / R3 moves
+//   upg_render.cpp   raylib drawing
+// (sigma_import.* and regions.* provide an alternative builder and the live
+//  pin/region tracking; Sandbox_UPG.cpp is the physics + game-loop driver.)
 // ============================================================================
 
 #include <raylib.h>
@@ -231,14 +240,14 @@ struct LoopModel {
     }
     bool IsVertexIdx(int i) const { return i >= 0 && beads[i].isVertex; }
 
-    // topology surgery (implemented in upg.cpp)
+    // topology surgery (implemented in upg_surgery.cpp)
     ArcWalk WalkFromSlot(int crossingBeadIdx, int slot) const;
     std::vector<int> FindSelfLoop(int crossingBeadIdx) const;
     std::vector<ArcWalk> ArcsBetween(int A, int B) const;
     void ReplaceLink(int x, int oldN, int newN);
     void CollapseRegion(const std::vector<int>& doomed);
 
-    // dynamic resampling (implemented in upg.cpp): keep edge beads dense enough
+    // dynamic resampling (implemented in upg_surgery.cpp): keep edge beads dense enough
     // that the bead-to-bead self-avoidance can't be threaded through a gap.
     int  InsertEdgeBead(int a, int b);        // new bead at the midpoint of link a-b
     int  SplitLink(int x, int y);             // new edge bead on link x-y (y may be a crossing)
@@ -254,7 +263,7 @@ struct LoopModel {
     struct CrossingStrands { int crossBead; std::map<int, int> strandOf; };
     std::vector<CrossingStrands> BuildCrossingStrandMap() const;
 
-    // arc / face queries (implemented in upg.cpp)
+    // arc / face queries (implemented in upg_faces.cpp)
     std::vector<SlotArc> ArcsFrom(int crossingBeadIdx) const;
     int  SlotOf(int vertexBead, int bead) const;
     bool ValidBigon(int A, int B, const SlotArc& i, const SlotArc& j) const;
@@ -295,7 +304,7 @@ struct LoopModel {
 
 
 // ============================================================================
-// 3. BUILD / UTILITY / RENDER  (implemented in upg.cpp)
+// 3. BUILD / UTILITY / RENDER  (build in upg_build.cpp, render in upg_render.cpp)
 // ============================================================================
 
 Vector2 GridCoordToCanvasCoord(float x, float y);
