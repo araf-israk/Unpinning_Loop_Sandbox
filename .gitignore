@@ -6,7 +6,6 @@ x64/
 *.pdb
 *.ipch
 *.obj
-*.exe
 *.ilk
 
 # macOS / Linux (Makefile artifacts)
