@@ -60,7 +60,7 @@ const float INTEGRATION_STEP = 0.15f;
 const float CENTER_SPEED = 0.15f;
 const float PIN_BUFFER_RADIUS = REST_LENGTH * 1.5f;
 
-const int   UPDATES_PER_FRAME = 5;
+const int   UPDATES_PER_FRAME = 10;
 
 // Self-avoidance: two strands repel everywhere EXCEPT within this radius of a
 // shared crossing, where they are allowed to coincide (that is the crossing).
@@ -116,6 +116,34 @@ const int   R3_GROW_FRAMES = 54;
 const int   MORPH_FRAMES = 140;      // R3 morph: crossings slide to the arc midpoints (slow, so the merge reads clearly)
 
 const int   R3_WALK_GAP = 20;       // frames between T-junction hops during the R3 walk (shared by walk + merge timing)
+
+// ----- R3 walk outward-routing experiments (try each independently) -----
+// The animated R3 T-junction walk rewires topology but leaves bead POSITIONS to
+// the physics relaxer, which interpolates each migrating stem along a straight
+// chord -- and that chord can cut across the triangle interior and the other two
+// arcs, where the bead-to-bead self-avoidance is sparse enough to be threaded.
+// Both options bias the walk to the OUTER side of the triangle (the half-plane
+// away from the centroid captured in r3Center) so strands wrap the region:
+//   Option 1 (R3_NUDGE_OUTWARD): nudge each relocated junction / merged crossing
+//            and the stem it drags outward, on every hop and at every merge.
+//   Option 2 (R3_PREBOW_STEM):   drop an outward guide bead on each stem the
+//            instant it is detached, so it starts pre-bent around the outside.
+// Set one false to isolate the other; both true combines them.
+const bool  R3_NUDGE_OUTWARD = true;    // Option 1
+const bool  R3_PREBOW_STEM = false;    // Option 2
+const float R3_OUTWARD_NUDGE = 1.5f * REST_LENGTH;   // per-hop / per-merge offset (Option 1)
+const float R3_STEM_BOW = 1.0f * REST_LENGTH;   // guide-bead outward bow   (Option 2)
+
+// ----- Smooth-transition toggles for the manual (pin-click) R-moves -----
+// R1 + R2: route the click through the SAME shrink-to-zero collapse the auto-
+// tightener uses (arc rest lengths ramp 1->0 via the transitions map, then the
+// region is spliced by CollapseRegion) instead of the bead-at-a-time eat (R1)
+// or the single-frame surgery (R2). Set false for the legacy paths.
+// R3: ease each T-junction hop -- the promoted junction starts at the OLD
+// junction's position and springs forward one bead, so the branch point slides
+// instead of teleporting. Independent of the outward-routing options above.
+const bool  SMOOTH_R1R2_VIA_COLLAPSE = true;
+const bool  R3_EASE_HOPS = true;
 
 // R1 monogon collapse eats the self-loop one edge bead at a time; this is the
 // frame gap between successive bead removals (the loop visibly retracts into
@@ -230,6 +258,14 @@ struct LoopModel {
     std::map<int, BeadTransition>   transitions;
 
     std::mt19937 rng{ std::random_device{}() };
+
+    // Transient state for the animated R3 T-junction walk: the triangle centroid
+    // captured at move start, and a flag true only while the walk's scheduled
+    // callbacks are still in flight. The outward-routing options above read these
+    // to bow each migrating junction / stem around the OUTSIDE of the triangle.
+    // Inert (no geometric change) whenever r3Active is false.
+    Vector2 r3Center{ 0.0f, 0.0f };
+    bool    r3Active = false;
 
     int Through(int vertexBead, int fromBead) const {
         const Bead& v = beads[vertexBead];

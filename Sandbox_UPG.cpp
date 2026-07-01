@@ -644,7 +644,7 @@ struct StartMenu {
         DrawRectangleRec(btn, hover ? BLUE : Fade(BLUE, 0.7f));
         const char* bl = "START";
         DrawText(bl, (int)(btn.x + btn.width / 2) - MeasureText(bl, 24) / 2,
-                 (int)(btn.y + btn.height / 2) - 12, 24, WHITE);
+            (int)(btn.y + btn.height / 2) - 12, 24, WHITE);
 
         // error message
         if (!error.empty()) {

@@ -41,6 +41,17 @@
 #include <algorithm>
 #include <cstdio>
 
+namespace {
+    // Push a bead outward, away from `center` (the R3 triangle centroid), by `delta`.
+    // Shared by the outward-routing options so a migrating junction / stem bows around
+    // the OUTSIDE of the triangle instead of cutting a chord through its interior.
+    void NudgeBeadOutward(Bead& b, Vector2 center, float delta) {
+        float dx = b.pos.x - center.x, dy = b.pos.y - center.y;
+        float L = std::hypot(dx, dy);
+        if (L > GEOM_EPS) { b.pos.x += dx / L * delta; b.pos.y += dy / L * delta; }
+    }
+} // namespace
+
 
 
 // R1 monogon removal, animated. The clicked face is a self-loop hanging off one
@@ -412,6 +423,17 @@ void LoopModel::CreateTConnection(int V, int O, int A) {
     // (Note: You do not need to call ReplaceLink for A_prev or A_next, 
     // because their pointers are still correctly aimed at index 'A'!)
     //beads[V].isVertex = false;
+
+    // Option 2: pre-bow the just-detached stem to the OUTSIDE of the triangle by
+    // dropping an outward guide bead between the junction A and the stem O. A
+    // densely, outward-sampled stem can't be threaded by the bead-to-bead self-
+    // avoidance, so it wraps the region instead of slipping through it. SplitLink
+    // seats the new bead at the O-A midpoint; we then push it outward. No-op
+    // outside an R3 walk.
+    if (r3Active && R3_PREBOW_STEM) {
+        int g = SplitLink(O, A);
+        if (g >= 0) NudgeBeadOutward(beads[g], r3Center, R3_STEM_BOW);
+    }
 }
 
 //.
@@ -451,6 +473,19 @@ void LoopModel::TraverseTConnection(int T, int A) {
 
     // The stem strand now attaches to A instead of T.
     if (stem >= 0) ReplaceLink(stem, T, A);
+
+    // Smooth the hop: seat the new junction where the OLD one was, so physics
+    // springs it forward one bead over the gap instead of the branch point
+    // teleporting. Done before the outward nudge so the bow still applies.
+    if (r3Active && R3_EASE_HOPS) beads[A].pos = beads[T].pos;
+
+    // Option 1: bias the relocated junction (and the stem it drags) to the OUTSIDE
+    // of the triangle, so the walk wraps the region rather than sweeping a straight
+    // chord through its interior. No-op outside an R3 walk (r3Active == false).
+    if (r3Active && R3_NUDGE_OUTWARD) {
+        NudgeBeadOutward(beads[A], r3Center, R3_OUTWARD_NUDGE);
+        if (stem >= 0) NudgeBeadOutward(beads[stem], r3Center, R3_OUTWARD_NUDGE);
+    }
 }
 
 
@@ -493,6 +528,14 @@ void LoopModel::MergeTConnections(int T1, int T2) {
     // Seat the crossing midway between the old junctions, then retire T2.
     beads[T1].pos = { (beads[T1].pos.x + beads[T2].pos.x) * 0.5f,
                       (beads[T1].pos.y + beads[T2].pos.y) * 0.5f };
+
+    // Option 1: seat the merged crossing (and its two transverse legs) on the OUTER
+    // side of the arc, so the freshly-woven strands settle outside the triangle.
+    if (r3Active && R3_NUDGE_OUTWARD) {
+        NudgeBeadOutward(beads[T1], r3Center, R3_OUTWARD_NUDGE);
+        if (s1 >= 0) NudgeBeadOutward(beads[s1], r3Center, R3_OUTWARD_NUDGE);
+        if (s2 >= 0) NudgeBeadOutward(beads[s2], r3Center, R3_OUTWARD_NUDGE);
+    }
     beads[T2].active = false;
     beads[T2].isVertex = false;
     beads[T2].crossing = -1;
@@ -636,6 +679,13 @@ void LoopModel::Perform_R3_Walk_S3(int V0, int V1, int V2, FaceClass& f, std::fu
         }
         return -1;
         };
+    // Capture the triangle centroid from the corner positions BEFORE the surgery
+    // below demotes them, and arm the outward-routing options for the duration of
+    // this (possibly scheduled) walk. r3Active is cleared once the last merge has
+    // run (see the schedule tail below / the synchronous else-branch).
+    r3Center = { (beads[V0].pos.x + beads[V1].pos.x + beads[V2].pos.x) / 3.0f,
+                 (beads[V0].pos.y + beads[V1].pos.y + beads[V2].pos.y) / 3.0f };
+    r3Active = (R3_NUDGE_OUTWARD || R3_PREBOW_STEM || R3_EASE_HOPS);
     Perform_R3_Walk_S1(V0, slotForArc(V0, f.triArcs[0]), slotForArc(V0, f.triArcs[2]), f.triArcs[0], f.triArcs[2], schedule);
     Perform_R3_Walk_S1(V1, slotForArc(V1, f.triArcs[0]), slotForArc(V1, f.triArcs[1]), f.triArcs[0], f.triArcs[1], schedule);
     Perform_R3_Walk_S1(V2, slotForArc(V2, f.triArcs[2]), slotForArc(V2, f.triArcs[1]), f.triArcs[2], f.triArcs[1], schedule);
@@ -662,13 +712,14 @@ void LoopModel::Perform_R3_Walk_S3(int V0, int V1, int V2, FaceClass& f, std::fu
             lastMerge = std::max(lastMerge, when);
             schedule(when, [mergeArc, arc] { mergeArc(arc); });
         }
-        schedule(lastMerge + R3_WALK_GAP, [this] { RebuildCrossingList(); });
+        schedule(lastMerge + R3_WALK_GAP, [this] { RebuildCrossingList(); r3Active = false; });
     }
     else {
         mergeArc(f.triArcs[0]);
         mergeArc(f.triArcs[1]);
         mergeArc(f.triArcs[2]);
         RebuildCrossingList();
+        r3Active = false;
     }
 }
 
