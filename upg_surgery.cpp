@@ -184,6 +184,243 @@ int LoopModel::SplitLink(int x, int y) {
     return m;
 }
 
+// Insert a fresh edge bead on the link between two ADJACENT beads u and v, where
+// EITHER may be a crossing. This generalises SplitLink (which requires x to be an
+// edge bead): it is the only splitter that can lengthen a 0-bead arc -- two
+// crossings linked directly with no edge bead between them. Rewires u <-> new <-> v
+// at the midpoint. Returns the new bead index, or -1 if u,v are not an adjacent,
+// active pair.
+int LoopModel::SpliceBeadBetween(int u, int v) {
+    if (u < 0 || v < 0 || u >= (int)beads.size() || v >= (int)beads.size()) return -1;
+    if (u == v || !beads[u].active || !beads[v].active) return -1;
+
+    auto adjacent = [&](int x, int y) {
+        if (beads[x].isVertex) {
+            for (int s = 0; s < 4; ++s) if (beads[x].neighborOfSlot[s] == y) return true;
+            return false;
+        }
+        return beads[x].neighbors[0] == y || beads[x].neighbors[1] == y;
+        };
+    if (!adjacent(u, v) || !adjacent(v, u)) return -1;
+
+    // Build from u/v BEFORE push_back (which may reallocate and dangle refs).
+    Bead nb;
+    nb.id = (int)beads.size();
+    nb.isVertex = false;
+    nb.active = true;
+    nb.edge = beads[u].isVertex ? beads[v].edge : beads[u].edge;
+    nb.pos = { (beads[u].pos.x + beads[v].pos.x) * 0.5f,
+               (beads[u].pos.y + beads[v].pos.y) * 0.5f };
+    nb.neighbors[0] = u;
+    nb.neighbors[1] = v;
+    int m = nb.id;
+    beads.push_back(nb);                 // u/v references now invalid; use indices
+
+    auto repoint = [&](int x, int oldN) {
+        if (beads[x].isVertex) {
+            for (int s = 0; s < 4; ++s) if (beads[x].neighborOfSlot[s] == oldN) { beads[x].neighborOfSlot[s] = m; return; }
+        }
+        else {
+            if (beads[x].neighbors[0] == oldN) beads[x].neighbors[0] = m;
+            else if (beads[x].neighbors[1] == oldN) beads[x].neighbors[1] = m;
+        }
+        };
+    repoint(u, v);
+    repoint(v, u);
+    return m;
+}
+
+// Continuous hygiene: guarantee every crossing-to-crossing arc carries at least
+// `minBeads` edge beads, inserting on the arc's longest link until it does. This
+// prevents the diagram from ever developing a 0- or 1-bead arc (which corrupts the
+// R3 converging walk and can leave region tracing / rendering ill-formed). Each
+// arc is visited once via a canonical (crossing,slot) endpoint key so parallel
+// arcs and self-arcs are handled correctly. Arcs touching a bead mid-transition
+// (an R1/R2 collapse in progress) are left alone. Returns the number of beads
+// added. Call on a settled loop, never mid-R3-walk (r3Active), since inserting
+// into an arc being walked would desync the scheduled hops.
+int LoopModel::EnsureMinArcBeads(int minBeads) {
+    if (minBeads < 1) return 0;
+    int added = 0;
+
+    std::vector<int> crossings;
+    for (int i = 0; i < (int)beads.size(); ++i)
+        if (beads[i].active && beads[i].isVertex) crossings.push_back(i);
+
+    for (int ci : crossings) {
+        for (int s = 0; s < 4; ++s) {
+            if (!beads[ci].active || !beads[ci].isVertex) break;
+            if (beads[ci].neighborOfSlot[s] < 0) continue;
+
+            ArcWalk w = WalkFromSlot(ci, s);
+            int other = w.endVertex;
+            if (other < 0) continue;                 // dangling half-strand: skip
+
+            // Skip arcs with a bead mid-collapse so a split can't corrupt a removal.
+            bool transitioning = false;
+            for (int b : w.beads) if (transitions.count(b)) { transitioning = true; break; }
+            if (transitioning) continue;
+
+            // Canonical endpoint key: process each arc from its smaller (crossing,slot)
+            // end only, so parallel arcs between the same two crossings are distinct.
+            int want = w.beads.empty() ? ci : w.beads.back();
+            int entry = -1;
+            for (int t = 0; t < 4; ++t) if (beads[other].neighborOfSlot[t] == want) { entry = t; break; }
+            if (entry >= 0) {
+                long long a = (long long)ci * 4 + s, b = (long long)other * 4 + entry;
+                if (a > b) continue;                 // handled from the other end
+            }
+
+            int have = (int)w.beads.size();
+            int guard = 0;
+            while (have < minBeads && guard++ < minBeads + 4) {
+                // Rebuild the ordered node list [ci, arc..., other] and split its
+                // longest consecutive link, spreading beads evenly rather than piling.
+                std::vector<int> nodes; nodes.reserve(have + 2);
+                nodes.push_back(ci);
+                for (int b : w.beads) nodes.push_back(b);
+                nodes.push_back(other);
+
+                int bestI = -1; float bestLen2 = -1.0f;
+                for (int i = 0; i + 1 < (int)nodes.size(); ++i) {
+                    Vector2 p = beads[nodes[i]].pos, q = beads[nodes[i + 1]].pos;
+                    float d2 = (p.x - q.x) * (p.x - q.x) + (p.y - q.y) * (p.y - q.y);
+                    if (d2 > bestLen2) { bestLen2 = d2; bestI = i; }
+                }
+                if (bestI < 0) break;
+                int mnew = SpliceBeadBetween(nodes[bestI], nodes[bestI + 1]);
+                if (mnew < 0) break;
+                ++added;
+
+                w = WalkFromSlot(ci, s);             // re-read: the arc just grew
+                have = (int)w.beads.size();
+            }
+        }
+    }
+    return added;
+}
+
+// The bead floor for one arc, by the face it bounds. A self-loop (other == ci) is a
+// monogon; an arc with a second, different-strand crossing-free arc to the same
+// crossing is one side of a bigon. Everything else gets the general floor.
+int LoopModel::ArcMinTarget(int ci, int s, int other) const {
+    int base;
+    if (other == ci) base = std::max(MIN_ARC_BEADS, MONOGON_MIN_BEADS);   // monogon self-loop
+    else {
+        base = MIN_ARC_BEADS;
+        for (int t = 0; t < 4; ++t) {                                     // bigon partner arc?
+            if (t == s) continue;
+            if (beads[ci].neighborOfSlot[t] < 0) continue;
+            if (beads[ci].throughSlot[s] == t) continue;   // same strand as s: not a lens partner
+            ArcWalk w = WalkFromSlot(ci, t);
+            if (w.endVertex == other) { base = std::max(MIN_ARC_BEADS, BIGON_MIN_BEADS); break; }
+        }
+    }
+
+    // Adaptive cap: never demand more beads than the arc can actually hold at
+    // BEAD_MIN_SEP spacing, or a short arc gets padded past capacity and left
+    // overlapping. Measure the arc's live polyline length (which shrinks toward the
+    // chord as the smoothing force straightens it) and cap the target so k beads
+    // leave k+1 gaps each >= BEAD_MIN_SEP. Floored at ARC_HARD_FLOOR so the arc
+    // stays well-formed even for two crossings sitting right on top of each other.
+    ArcWalk w = WalkFromSlot(ci, s);
+    float len = 0.0f; int prev = ci;
+    for (int b : w.beads) {
+        len += std::hypot(beads[b].pos.x - beads[prev].pos.x,
+            beads[b].pos.y - beads[prev].pos.y); prev = b;
+    }
+    len += std::hypot(beads[other].pos.x - beads[prev].pos.x,
+        beads[other].pos.y - beads[prev].pos.y);
+    int capacity = (int)(len / BEAD_MIN_SEP) - 1;
+    if (capacity < ARC_HARD_FLOOR) capacity = ARC_HARD_FLOOR;
+    if (base > capacity) base = capacity;
+    return base;
+}
+
+// Single per-arc density authority: for every crossing-to-crossing arc, (1) PAD it
+// up to its face-aware floor (ArcMinTarget) by splitting the longest link, then
+// (2) THIN out consecutive edge beads closer than overlapDist -- the piles and
+// overlaps surgery leaves behind -- but never below that same floor, so the pad and
+// thin steps share one target and cannot oscillate against each other. Each arc is
+// visited once (canonical endpoint key), and arcs with a bead mid-collapse are left
+// alone. Detects monogons and bigons implicitly via ArcMinTarget. Returns the total
+// number of beads added + removed. Call on a settled loop, never mid-R3-walk.
+int LoopModel::NormalizeArcBeads(float overlapDist) {
+    int changed = 0;
+    const float od2 = overlapDist * overlapDist;
+
+    std::vector<int> crossings;
+    for (int i = 0; i < (int)beads.size(); ++i)
+        if (beads[i].active && beads[i].isVertex) crossings.push_back(i);
+
+    for (int ci : crossings) {
+        for (int s = 0; s < 4; ++s) {
+            if (!beads[ci].active || !beads[ci].isVertex) break;
+            if (beads[ci].neighborOfSlot[s] < 0) continue;
+
+            ArcWalk w = WalkFromSlot(ci, s);
+            int other = w.endVertex;
+            if (other < 0) continue;
+
+            bool transitioning = false;
+            for (int b : w.beads) if (transitions.count(b)) { transitioning = true; break; }
+            if (transitioning) continue;
+
+            int want = w.beads.empty() ? ci : w.beads.back();
+            int entry = -1;
+            for (int t = 0; t < 4; ++t) if (beads[other].neighborOfSlot[t] == want) { entry = t; break; }
+            if (entry >= 0) {
+                long long a = (long long)ci * 4 + s, b = (long long)other * 4 + entry;
+                if (a > b) continue;                 // handled from the other end
+            }
+
+            const int target = ArcMinTarget(ci, s, other);
+
+            // (1) PAD up to target: split the longest link each pass.
+            int have = (int)w.beads.size();
+            int guard = 0;
+            while (have < target && guard++ < target + 8) {
+                std::vector<int> nodes; nodes.reserve(have + 2);
+                nodes.push_back(ci);
+                for (int b : w.beads) nodes.push_back(b);
+                nodes.push_back(other);
+                int bestI = -1; float bestLen2 = -1.0f;
+                for (int i = 0; i + 1 < (int)nodes.size(); ++i) {
+                    if (nodes[i] == nodes[i + 1]) continue;   // degenerate self-link: can't split
+                    Vector2 p = beads[nodes[i]].pos, q = beads[nodes[i + 1]].pos;
+                    float d2 = (p.x - q.x) * (p.x - q.x) + (p.y - q.y) * (p.y - q.y);
+                    if (d2 > bestLen2) { bestLen2 = d2; bestI = i; }
+                }
+                if (bestI < 0) break;
+                int m = SpliceBeadBetween(nodes[bestI], nodes[bestI + 1]);
+                if (m < 0) break;
+                ++changed;
+                w = WalkFromSlot(ci, s); have = (int)w.beads.size();
+            }
+
+            // (2) THIN overlaps down to (never below) target. Greedy from ci: drop a
+            // bead within overlapDist of the last kept one; measure the next against
+            // the last SURVIVOR so a run of piled beads collapses to one.
+            w = WalkFromSlot(ci, s);
+            int budget = (int)w.beads.size() - target;
+            if (budget > 0) {
+                Vector2 lastPos = beads[ci].pos;
+                for (int b : w.beads) {
+                    if (budget <= 0) break;
+                    if (!beads[b].active) continue;
+                    if (transitions.count(b)) { lastPos = beads[b].pos; continue; }
+                    float dx = beads[b].pos.x - lastPos.x, dy = beads[b].pos.y - lastPos.y;
+                    if (dx * dx + dy * dy < od2 && RemoveEdgeBead(b) >= 0) {
+                        --budget; ++changed; continue;    // b gone: keep lastPos on the survivor
+                    }
+                    lastPos = beads[b].pos;
+                }
+            }
+        }
+    }
+    return changed;
+}
+
 // One resampling pass: every link between two edge beads longer than maxLen gets
 // a bead at its midpoint. Links are deduplicated by endpoint pair (orientation
 // of neighbors[] is not globally consistent after surgery), and beads currently

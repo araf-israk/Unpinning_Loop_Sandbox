@@ -42,13 +42,21 @@
 #include <cstdio>
 
 namespace {
-    // Push a bead outward, away from `center` (the R3 triangle centroid), by `delta`.
-    // Shared by the outward-routing options so a migrating junction / stem bows around
-    // the OUTSIDE of the triangle instead of cutting a chord through its interior.
-    void NudgeBeadOutward(Bead& b, Vector2 center, float delta) {
-        float dx = b.pos.x - center.x, dy = b.pos.y - center.y;
-        float L = std::hypot(dx, dy);
-        if (L > GEOM_EPS) { b.pos.x += dx / L * delta; b.pos.y += dy / L * delta; }
+    // Seat bead `b` so it leaves `junction` PERPENDICULAR to the bar (the segment
+    // barA--barB), on the side away from `center`, at distance `delta`. Tracking the
+    // local bar orientation (rather than a fixed centroid ray) keeps the stem off the
+    // arc even where the arc curves or the centroid sits nearly on it. Used by the
+    // walk and the merge (Option 3, R3_NORMAL_STEM).
+    void PlaceBeadNormalToBar(Bead& b, Vector2 junction, Vector2 barA, Vector2 barB,
+        Vector2 center, float delta) {
+        float tx = barB.x - barA.x, ty = barB.y - barA.y;   // bar tangent
+        float L = std::hypot(tx, ty);
+        if (L <= GEOM_EPS) return;
+        float nx = -ty / L, ny = tx / L;                    // unit normal to the bar
+        float ox = junction.x - center.x, oy = junction.y - center.y;
+        if (nx * ox + ny * oy < 0.0f) { nx = -nx; ny = -ny; }  // pick the outward side
+        b.pos.x = junction.x + nx * delta;
+        b.pos.y = junction.y + ny * delta;
     }
 } // namespace
 
@@ -423,17 +431,6 @@ void LoopModel::CreateTConnection(int V, int O, int A) {
     // (Note: You do not need to call ReplaceLink for A_prev or A_next, 
     // because their pointers are still correctly aimed at index 'A'!)
     //beads[V].isVertex = false;
-
-    // Option 2: pre-bow the just-detached stem to the OUTSIDE of the triangle by
-    // dropping an outward guide bead between the junction A and the stem O. A
-    // densely, outward-sampled stem can't be threaded by the bead-to-bead self-
-    // avoidance, so it wraps the region instead of slipping through it. SplitLink
-    // seats the new bead at the O-A midpoint; we then push it outward. No-op
-    // outside an R3 walk.
-    if (r3Active && R3_PREBOW_STEM) {
-        int g = SplitLink(O, A);
-        if (g >= 0) NudgeBeadOutward(beads[g], r3Center, R3_STEM_BOW);
-    }
 }
 
 //.
@@ -444,6 +441,7 @@ void LoopModel::CreateTConnection(int V, int O, int A) {
 // relocates the branch point; it does not change the diagram.
 void LoopModel::TraverseTConnection(int T, int A) {
     if (T < 0 || A < 0) return;
+    if (!beads[T].active || !beads[A].active) return;      // a between-hop prune may have severed one
     if (!beads[T].isVertex || beads[A].isVertex) return;   // T = junction, A = plain bar bead
 
     // A must sit on T's bar (slot 0 or slot 2). slot 1 is the stem, slot 3 dead.
@@ -474,17 +472,13 @@ void LoopModel::TraverseTConnection(int T, int A) {
     // The stem strand now attaches to A instead of T.
     if (stem >= 0) ReplaceLink(stem, T, A);
 
-    // Smooth the hop: seat the new junction where the OLD one was, so physics
-    // springs it forward one bead over the gap instead of the branch point
-    // teleporting. Done before the outward nudge so the bow still applies.
-    if (r3Active && R3_EASE_HOPS) beads[A].pos = beads[T].pos;
-
-    // Option 1: bias the relocated junction (and the stem it drags) to the OUTSIDE
-    // of the triangle, so the walk wraps the region rather than sweeping a straight
-    // chord through its interior. No-op outside an R3 walk (r3Active == false).
-    if (r3Active && R3_NUDGE_OUTWARD) {
-        NudgeBeadOutward(beads[A], r3Center, R3_OUTWARD_NUDGE);
-        if (stem >= 0) NudgeBeadOutward(beads[stem], r3Center, R3_OUTWARD_NUDGE);
+    // Option 3: drop the stem on the local bar's outward NORMAL. A's bar now runs
+    // T (slot 0, behind) -> A_far (slot 2, ahead); the stem leaves at ~90deg to it
+    // on the outward side, following the arc as the junction walks it. r3Center is
+    // used only to pick the outward sign, not the push direction.
+    if (r3Active && R3_NORMAL_STEM && stem >= 0) {
+        PlaceBeadNormalToBar(beads[stem], beads[A].pos, beads[T].pos, beads[A_far].pos,
+            r3Center, R3_STEM_NORMAL_LEN);
     }
 }
 
@@ -529,18 +523,62 @@ void LoopModel::MergeTConnections(int T1, int T2) {
     beads[T1].pos = { (beads[T1].pos.x + beads[T2].pos.x) * 0.5f,
                       (beads[T1].pos.y + beads[T2].pos.y) * 0.5f };
 
-    // Option 1: seat the merged crossing (and its two transverse legs) on the OUTER
-    // side of the arc, so the freshly-woven strands settle outside the triangle.
-    if (r3Active && R3_NUDGE_OUTWARD) {
-        NudgeBeadOutward(beads[T1], r3Center, R3_OUTWARD_NUDGE);
-        if (s1 >= 0) NudgeBeadOutward(beads[s1], r3Center, R3_OUTWARD_NUDGE);
-        if (s2 >= 0) NudgeBeadOutward(beads[s2], r3Center, R3_OUTWARD_NUDGE);
+    // Option 3: at the fused crossing there is no stem/bar -- both strands pass
+    // straight through -- so "perpendicular" becomes "straight". Offset the crossing
+    // along the outerA--outerB chord's outward normal, then seat each transverse leg
+    // opposite its through-partner (strand outerA--T1--s2, strand outerB--T1--s1) so
+    // each strand runs straight through T1 as a clean X rather than kinking.
+    if (r3Active && R3_NORMAL_STEM) {
+        PlaceBeadNormalToBar(beads[T1], beads[T1].pos, beads[outerA].pos, beads[outerB].pos,
+            r3Center, R3_STEM_NORMAL_LEN);
+        auto seatOpposite = [&](int leg, int partner) {
+            if (leg < 0 || partner < 0) return;
+            float dx = beads[T1].pos.x - beads[partner].pos.x;
+            float dy = beads[T1].pos.y - beads[partner].pos.y;
+            float L = std::hypot(dx, dy);
+            if (L <= GEOM_EPS) return;
+            beads[leg].pos.x = beads[T1].pos.x + dx / L * REST_LENGTH;
+            beads[leg].pos.y = beads[T1].pos.y + dy / L * REST_LENGTH;
+            };
+        seatOpposite(s2, outerA);   // strand outerA--T1--s2
+        seatOpposite(s1, outerB);   // strand outerB--T1--s1
     }
     beads[T2].active = false;
     beads[T2].isVertex = false;
     beads[T2].crossing = -1;
     for (int s = 0; s < 4; ++s) { beads[T2].neighborOfSlot[s] = -1; beads[T2].throughSlot[s] = -1; }
     beads[T2].neighbors[0] = beads[T2].neighbors[1] = -1;
+}
+
+// Option 3b: a soft, length-preserving angular spring. At every live strict
+// T-junction it pulls the stem toward the bar's outward normal, so the branch is
+// held at ~90deg across all physics substeps instead of only being placed once per
+// hop (which the edge springs can undo before the next hop). Call once per substep
+// from the physics loop while r3Active; inert otherwise. `center` is the triangle
+// centroid (used only to choose the outward side); `k` is the spring stiffness.
+void LoopModel::ApplyStemNormalForces(Vector2 center, float k) {
+    for (int i = 0; i < (int)beads.size(); ++i) {
+        Bead& J = beads[i];
+        if (!J.active || !J.isVertex) continue;
+        if (J.neighborOfSlot[3] != -1) continue;          // strict T-junctions only (dead slot 3)
+        int bar0 = J.neighborOfSlot[0], bar2 = J.neighborOfSlot[2], stem = J.neighborOfSlot[1];
+        if (bar0 < 0 || bar2 < 0 || stem < 0) continue;
+
+        float tx = beads[bar2].pos.x - beads[bar0].pos.x;  // bar tangent
+        float ty = beads[bar2].pos.y - beads[bar0].pos.y;
+        float L = std::hypot(tx, ty);
+        if (L <= GEOM_EPS) continue;
+        float nx = -ty / L, ny = tx / L;                   // unit normal to the bar
+        float ox = J.pos.x - center.x, oy = J.pos.y - center.y;
+        if (nx * ox + ny * oy < 0.0f) { nx = -nx; ny = -ny; }   // outward side
+
+        float sx = beads[stem].pos.x - J.pos.x, sy = beads[stem].pos.y - J.pos.y;
+        float sl = std::hypot(sx, sy);
+        if (sl <= GEOM_EPS) continue;
+        float tX = J.pos.x + nx * sl, tY = J.pos.y + ny * sl;   // same radius, on the normal
+        beads[stem].force.x += (tX - beads[stem].pos.x) * k;
+        beads[stem].force.y += (tY - beads[stem].pos.y) * k;
+    }
 }
 
 // crossingBead must list exactly the live crossings. The T-junction R3 demotes the
@@ -647,26 +685,55 @@ int LoopModel::FindSlotTowardsCrossing(int crossingA, int crossingB) const {
 }
 
 void LoopModel::Perform_R3_Walk_S3(int V0, int V1, int V2, FaceClass& f, std::function<void(int, std::function<void()>)> schedule) {
-    // Degenerate-arc guard. The converging-walk surgery needs each triangle arc to
-    // carry two DISTINCT T-junctions (one per end) that meet and merge. A one-bead
-    // arc forces both ends onto the same bead, leaving an unmerged junction with a
-    // dangling dead slot (later dereferenced as beads[-1]); an empty arc makes one
-    // crossing's surgery early-return while the others proceed. So: abort cleanly
-    // on an empty arc, and subdivide any arc up to two beads before touching it.
+    // Degenerate-arc guard, hardened. The converging-walk surgery needs each
+    // triangle arc to carry two DISTINCT T-junctions (one per end) that meet and
+    // merge. A one-bead arc collapses both ends onto the same bead (leaving an
+    // unmerged junction whose dead slot is later dereferenced as beads[-1]); an
+    // empty arc -- two corners linked directly -- has no bead to walk at all. So we
+    // now PAD every arc up to R3_MIN_ARC_BEADS before touching it, splitting the
+    // longest link each time (SpliceBeadBetween can lengthen even a 0-bead arc, so
+    // empty arcs are repaired rather than aborting the whole move). Padding also
+    // makes the walk smoother: more beads => more, smaller hops.
+    if (f.triArcs.size() == 3) {
+        const int Vk[3] = { V0, V1, V2 };
+        // The arc's endpoint crossings: derive from the live links when the arc has
+        // beads; fall back to the corner order (triArcs[k] joins Vk[k] -> Vk[k+1])
+        // for an empty arc, whose endpoints can't be read from beads.
+        auto adjacentCorner = [&](int bead, int except) -> int {
+            for (int c : Vk) {
+                if (c == except || c < 0 || !beads[c].isVertex) continue;
+                for (int s = 0; s < 4; ++s) if (beads[c].neighborOfSlot[s] == bead) return c;
+            }
+            return -1;
+            };
+        auto padArc = [&](std::vector<int>& arc, int cfFallback, int cbFallback, int target) {
+            int cf = arc.empty() ? cfFallback : adjacentCorner(arc.front(), -1);
+            int cb = arc.empty() ? cbFallback : adjacentCorner(arc.back(), cf);
+            if (cf < 0) cf = cfFallback;
+            if (cb < 0) cb = cbFallback;
+            int guard = 0;
+            while ((int)arc.size() < target && guard++ < target + 8) {
+                std::vector<int> nodes; nodes.reserve(arc.size() + 2);
+                nodes.push_back(cf);
+                for (int b : arc) nodes.push_back(b);
+                nodes.push_back(cb);
+                int bestI = -1; float bestLen2 = -1.0f;
+                for (int i = 0; i + 1 < (int)nodes.size(); ++i) {
+                    Vector2 p = beads[nodes[i]].pos, q = beads[nodes[i + 1]].pos;
+                    float d2 = (p.x - q.x) * (p.x - q.x) + (p.y - q.y) * (p.y - q.y);
+                    if (d2 > bestLen2) { bestLen2 = d2; bestI = i; }
+                }
+                if (bestI < 0) break;
+                int m = SpliceBeadBetween(nodes[bestI], nodes[bestI + 1]);
+                if (m < 0) break;                       // not adjacent (bad endpoints): stop
+                arc.insert(arc.begin() + bestI, m);     // link i lands at arc index i
+            }
+            };
+        for (int k = 0; k < 3; ++k)
+            padArc(f.triArcs[k], Vk[k], Vk[(k + 1) % 3], R3_MIN_ARC_BEADS);
+    }
     for (auto& arc : f.triArcs)
-        if (arc.empty()) { printf("[R3] degenerate empty arc; move skipped\n"); return; }
-    for (auto& arc : f.triArcs)
-        while ((int)arc.size() < 2) {
-            int b = arc.back();
-            int inward = (arc.size() >= 2) ? arc[arc.size() - 2] : -1;
-            int out = (beads[b].neighbors[0] == inward) ? beads[b].neighbors[1]
-                : beads[b].neighbors[0];
-            int m = SplitLink(b, out);
-            if (m < 0) break;
-            arc.push_back(m);
-        }
-    for (auto& arc : f.triArcs)
-        if ((int)arc.size() < 2) { printf("[R3] arc too short to subdivide; move skipped\n"); return; }
+        if ((int)arc.size() < 2) { printf("[R3] arc too short after padding; move skipped\n"); return; }
 
     // The arc's endpoint bead names the exact leg, so slot-of-endpoint is
     // unambiguous even when an earlier R3 left >1 path between two crossings.
@@ -680,12 +747,13 @@ void LoopModel::Perform_R3_Walk_S3(int V0, int V1, int V2, FaceClass& f, std::fu
         return -1;
         };
     // Capture the triangle centroid from the corner positions BEFORE the surgery
-    // below demotes them, and arm the outward-routing options for the duration of
-    // this (possibly scheduled) walk. r3Active is cleared once the last merge has
+    // below demotes them, and mark the walk active for its (possibly scheduled)
+    // duration: this arms the normal-stem option / angular spring and suppresses
+    // arc re-normalisation mid-walk. r3Active is cleared once the last merge has
     // run (see the schedule tail below / the synchronous else-branch).
     r3Center = { (beads[V0].pos.x + beads[V1].pos.x + beads[V2].pos.x) / 3.0f,
                  (beads[V0].pos.y + beads[V1].pos.y + beads[V2].pos.y) / 3.0f };
-    r3Active = (R3_NUDGE_OUTWARD || R3_PREBOW_STEM || R3_EASE_HOPS);
+    r3Active = true;
     Perform_R3_Walk_S1(V0, slotForArc(V0, f.triArcs[0]), slotForArc(V0, f.triArcs[2]), f.triArcs[0], f.triArcs[2], schedule);
     Perform_R3_Walk_S1(V1, slotForArc(V1, f.triArcs[0]), slotForArc(V1, f.triArcs[1]), f.triArcs[0], f.triArcs[1], schedule);
     Perform_R3_Walk_S1(V2, slotForArc(V2, f.triArcs[2]), slotForArc(V2, f.triArcs[1]), f.triArcs[2], f.triArcs[1], schedule);

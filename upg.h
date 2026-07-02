@@ -54,8 +54,22 @@ const float GEOM_EPS = 1e-6f;
 const float STEP_SIZE = 0.5f;
 const float RADIUS = 0.25f * GRID_SIZE;
 const float REST_LENGTH = 2.0f * RADIUS;
-const float SPRING_CONSTANT = 2.0f;
-const float COLLISION_STIFFNESS = 1.5f;
+const float SPRING_CONSTANT = 1.0f;
+
+// Keep arcs taut and evenly spaced (see GameState::Step).
+//   K_SMOOTH: Laplacian smoothing force on each EDGE bead toward the midpoint of
+//     its two neighbours. With the length springs this straightens folds and
+//     distributes beads evenly; keep it well below SPRING_CONSTANT so it tidies
+//     without collapsing arcs onto their chords.
+//   EDGE_TENSION_SCALE: run the length-spring rest length a touch under
+//     REST_LENGTH so the whole loop sits under mild tension and slack does not
+//     accumulate. Directly-linked beads are exempt from the overlap projection, so
+//     this doesn't fight it. 1.0 == no tension; lower == tighter (don't go so low
+//     that short arcs are pulled below the overlap floor everywhere).
+const float K_SMOOTH = 0.20f;
+const float EDGE_TENSION_SCALE = 0.90f;
+
+const float COLLISION_STIFFNESS = 1.0f;
 const float INTEGRATION_STEP = 0.15f;
 const float CENTER_SPEED = 0.15f;
 const float PIN_BUFFER_RADIUS = REST_LENGTH * 1.5f;
@@ -79,6 +93,35 @@ const float EDGE_SPLIT_LENGTH = REST_LENGTH * 1.0f;
 const float EDGE_TOUCH_LENGTH = REST_LENGTH;   // disks overlap within this centre distance
 const float MIN_ARC_ANGLE_DEG = 45.0f;         // interior angle sharper than this => drop the apex bead
 
+// Minimum edge beads guaranteed on EVERY crossing-to-crossing arc. EnsureMinArcBeads
+// tops up any arc below this each settled frame, so the diagram never develops a
+// 0- or 1-bead arc between two crossings. A floor of 2 both keeps region tracing /
+// rendering well-formed and (crucially) guarantees the R3 converging walk always has
+// room: an empty or one-bead triangle arc used to collapse both walking T-junctions
+// onto one bead and dereference beads[-1]. Kept at 2 (not higher) so it does not
+// fight SimplifyDenseArcs -- a 2-bead arc has a crossing on one side of every bead,
+// so neither the hairpin nor the pile rule can remove it, hence no add/remove churn.
+const int   MIN_ARC_BEADS = 3;
+
+// Absolute minimum an arc may be thinned to, even when its two crossings are so
+// close that MIN_ARC_BEADS beads can't fit without overlap. The adaptive cap in
+// ArcMinTarget lets a short arc drop to this rather than being padded past what it
+// can hold; 2 keeps the arc well-formed for region tracing and the R3 walk.
+const int   ARC_HARD_FLOOR = 2;
+
+// Face-specific bead floors (each >= MIN_ARC_BEADS). A monogon (an R1 kink's self-
+// loop) and each arc of a bigon (an R2 lens) are padded to these so the loop / lens
+// reads as a rounded face and its collapse animates smoothly instead of snapping
+// from a 1-2 bead sliver.
+const int   MONOGON_MIN_BEADS = 6;
+const int   BIGON_MIN_BEADS = 6;
+
+// Overlap thinning: two CONSECUTIVE edge beads on the same arc closer than this are
+// redundant and the excess is spliced out -- but never below the arc's own floor,
+// so thinning can't fight the padding above. Well under REST_LENGTH, so normally
+// spaced beads are kept; this only catches piles/overlaps left by surgery.
+const float BEAD_OVERLAP_DIST = REST_LENGTH * 0.9f;
+
 // Hard non-overlap. The self-avoidance force above is a soft penalty that the
 // displacement clamp can cap, so deep overlaps still leak through. After every
 // integration substep a position-projection pass directly separates any pair of
@@ -89,7 +132,7 @@ const float MIN_ARC_ANGLE_DEG = 45.0f;         // interior angle sharper than th
 // passing nearby is still separated). Min centre separation is one bead diameter;
 // a few Gauss-Seidel sweeps per substep clear even tight clusters.
 const float BEAD_MIN_SEP = REST_LENGTH;   // = 2 * RADIUS: disks just touch, never overlap
-const int   OVERLAP_RESOLVE_ITERS = 1;
+const int   OVERLAP_RESOLVE_ITERS = 3;    // sweeps per substep; more clears tight clusters faster
 
 // Pins settle by repulsion balance: pushed away from every nearby strand bead
 // and crossing, a pin sits at the open centre of its face and cannot drift past
@@ -115,7 +158,15 @@ const int   R3_SLIDE_FRAMES = 58;       // guided flip into the clean layout
 const int   R3_GROW_FRAMES = 54;
 const int   MORPH_FRAMES = 140;      // R3 morph: crossings slide to the arc midpoints (slow, so the merge reads clearly)
 
-const int   R3_WALK_GAP = 20;       // frames between T-junction hops during the R3 walk (shared by walk + merge timing)
+const int   R3_WALK_GAP = 10;       // frames between T-junction hops during the R3 walk (shared by walk + merge timing)
+
+// Before an R3 walk, each of the three triangle arcs is padded up to this many
+// edge beads (spread on its longest links). More beads => more, smaller hops =>
+// a smoother converging glide, and it guarantees room for two distinct T-junctions
+// to walk toward the midpoint without landing on the same bead. These extra beads
+// are transient: SimplifyDenseArcs prunes the surplus once the move settles. Must
+// be >= 2; larger is smoother but slower (each extra bead adds ~R3_WALK_GAP frames).
+const int   R3_MIN_ARC_BEADS = 4;
 
 // ----- R3 walk outward-routing experiments (try each independently) -----
 // The animated R3 T-junction walk rewires topology but leaves bead POSITIONS to
@@ -129,10 +180,29 @@ const int   R3_WALK_GAP = 20;       // frames between T-junction hops during the
 //   Option 2 (R3_PREBOW_STEM):   drop an outward guide bead on each stem the
 //            instant it is detached, so it starts pre-bent around the outside.
 // Set one false to isolate the other; both true combines them.
-const bool  R3_NUDGE_OUTWARD = true;    // Option 1
+const bool  R3_NUDGE_OUTWARD = false;    // Option 1
 const bool  R3_PREBOW_STEM = false;    // Option 2
-const float R3_OUTWARD_NUDGE = 1.5f * REST_LENGTH;   // per-hop / per-merge offset (Option 1)
+const float R3_OUTWARD_NUDGE = 1.0f * REST_LENGTH;   // per-hop / per-merge offset (Option 1)
 const float R3_STEM_BOW = 1.0f * REST_LENGTH;   // guide-bead outward bow   (Option 2)
+
+//   Option 3 (R3_NORMAL_STEM): instead of pushing radially from the centroid,
+//            drop the stem PERPENDICULAR to the local bar (the segment through the
+//            junction's two bar neighbours), on the outward side. Because it tracks
+//            the local arc rather than a fixed centroid ray, it stays correct on
+//            curved / non-convex arcs and on skinny faces where the centroid sits
+//            almost on the arc (where the radial ray drifts sideways instead of
+//            away). At the merge the junction becomes a crossing, so "perpendicular"
+//            degrades to "straight through": each transverse leg is seated opposite
+//            its through-partner (a clean X) and the crossing is offset along the
+//            outerA--outerB chord's normal. No-op outside an R3 walk.
+// Option 3 composes with the others; it can fully replace Option 1's per-hop nudge.
+const bool  R3_NORMAL_STEM = false;                 // Option 3
+const float R3_STEM_NORMAL_LEN = 1.0f * REST_LENGTH;   // per-hop / per-merge normal offset (Option 3)
+// If the one-shot placement above is tugged back by the springs before the next
+// hop, ApplyStemNormalForces adds a standing per-substep angular spring holding the
+// stem on the bar normal. Start soft so it biases without fighting the edge springs.
+const bool  R3_NORMAL_STEM_SPRING = false;         // Option 3b: continuous angular hold
+const float R3_STEM_NORMAL_K = 0.15f;              // angular-spring stiffness (Option 3b)
 
 // ----- Smooth-transition toggles for the manual (pin-click) R-moves -----
 // R1 + R2: route the click through the SAME shrink-to-zero collapse the auto-
@@ -143,7 +213,7 @@ const float R3_STEM_BOW = 1.0f * REST_LENGTH;   // guide-bead outward bow   (Opt
 // junction's position and springs forward one bead, so the branch point slides
 // instead of teleporting. Independent of the outward-routing options above.
 const bool  SMOOTH_R1R2_VIA_COLLAPSE = true;
-const bool  R3_EASE_HOPS = true;
+const bool  R3_EASE_HOPS = false;
 
 // R1 monogon collapse eats the self-loop one edge bead at a time; this is the
 // frame gap between successive bead removals (the loop visibly retracts into
@@ -287,6 +357,10 @@ struct LoopModel {
     // that the bead-to-bead self-avoidance can't be threaded through a gap.
     int  InsertEdgeBead(int a, int b);        // new bead at the midpoint of link a-b
     int  SplitLink(int x, int y);             // new edge bead on link x-y (y may be a crossing)
+    int  SpliceBeadBetween(int u, int v);     // new edge bead on link u-v (EITHER may be a crossing)
+    int  EnsureMinArcBeads(int minBeads);     // top every crossing-to-crossing arc up to minBeads; returns beads added
+    int  ArcMinTarget(int crossingBeadIdx, int slot, int otherCrossing) const; // face-aware bead floor for one arc
+    int  NormalizeArcBeads(float overlapDist);// per arc: pad up to the face floor, then thin overlaps; returns net edits
     int  ResampleStretchedArcs(float maxLen); // split every over-long edge link; returns count
     int  RemoveEdgeBead(int b);               // splice an edge bead out, relinking its two neighbors
     int  SimplifyDenseArcs(float touchLen, float minAngleDeg); // drop kinked/piled beads; returns count
@@ -325,6 +399,7 @@ struct LoopModel {
     void CreateTConnection(int V, int O, int A);
     void TraverseTConnection(int T, int A);
     void MergeTConnections(int T1, int T2);   // fuse two adjacent T-junctions back into one crossing
+    void ApplyStemNormalForces(Vector2 center, float k);  // Option 3b: hold each T-junction stem on the bar normal (per substep)
     void RebuildCrossingList();               // crossingBead = every active vertex (call after R3 surgery)
     void Perform_R3_Walk_S3(int V0, int V1, int V2, FaceClass& f, std::function<void(int, std::function<void()>)> schedule);
     void Perform_R3_Walk_S1(int V, int S1, int S2, std::vector<int>& arc_b1, std::vector<int>& arc_b2,

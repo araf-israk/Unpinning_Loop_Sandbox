@@ -114,7 +114,7 @@ struct GameState {
         float dx = pb.x - pa.x, dy = pb.y - pa.y;
         float d = std::hypot(dx, dy);
         if (d < GEOM_EPS) return;
-        float rest = REST_LENGTH;
+        float rest = REST_LENGTH * EDGE_TENSION_SCALE;   // mild global tension: rest a touch short
         if (auto it = model.transitions.find(a); it != model.transitions.end()) rest *= it->second.scale;
         if (auto it = model.transitions.find(b); it != model.transitions.end()) rest *= it->second.scale;
         float disp = d - rest;
@@ -150,6 +150,32 @@ struct GameState {
             for (int s = 0; s < 4; ++s) {
                 int n = b.neighborOfSlot[s];
                 if (n > i && model.beads[n].isVertex && model.beads[n].active) AddSpring(i, n);
+            }
+        }
+
+        // 1c. Option 3b: hold each active T-junction's stem on its bar normal so the
+        // branch stays ~perpendicular across all substeps (not just at each hop). Inert
+        // unless an R3 walk is in progress and the toggle is on.
+        if (model.r3Active && R3_NORMAL_STEM_SPRING)
+            model.ApplyStemNormalForces(model.r3Center, R3_STEM_NORMAL_K);
+
+        // 1d. Laplacian smoothing: pull each EDGE bead toward the midpoint of its two
+        // strand-neighbours. Paired with the length springs (which resist compression
+        // below the rest length), this straightens folds and spreads beads evenly, so
+        // slack arcs pull taut instead of bunching. One-sided (no reaction on the
+        // neighbours) so crossings stay put; harmless in this overdamped relaxer.
+        // Skipped for beads mid-collapse so it can't disturb a transition.
+        if (K_SMOOTH > 0.0f) {
+            for (int i = 0; i < (int)model.beads.size(); ++i) {
+                Bead& b = model.beads[i];
+                if (b.isVertex || !b.active || b.driven) continue;
+                if (model.transitions.count(i)) continue;
+                int n0 = b.neighbors[0], n1 = b.neighbors[1];
+                if (n0 < 0 || n1 < 0 || !model.beads[n0].active || !model.beads[n1].active) continue;
+                float mx = 0.5f * (model.beads[n0].pos.x + model.beads[n1].pos.x);
+                float my = 0.5f * (model.beads[n0].pos.y + model.beads[n1].pos.y);
+                b.force.x += (mx - b.pos.x) * K_SMOOTH;
+                b.force.y += (my - b.pos.y) * K_SMOOTH;
             }
         }
 
@@ -529,7 +555,12 @@ struct GameState {
         if (jobs.empty()) {
             // Bead-adding is removed; only redundant kinked/piled beads are pruned.
             if (pending.empty() && delayedTasks.empty()) {
-                model.SimplifyDenseArcs(EDGE_TOUCH_LENGTH, MIN_ARC_ANGLE_DEG);
+                // Remove only hairpin (doubled-back) beads here (touchLen 0 disables
+                // the floorless pile branch); NormalizeArcBeads owns all overlap/pile
+                // thinning AND padding in one floor-respecting pass, so the two never
+                // oscillate. It also enforces the monogon / bigon minimums.
+                model.SimplifyDenseArcs(0.0f, MIN_ARC_ANGLE_DEG);
+                if (!model.r3Active) model.NormalizeArcBeads(BEAD_OVERLAP_DIST);
                 // Recompute regions from the live diagram and keep exactly one pin
                 // per bounded region, each inside it. Runs only on a fully clean,
                 // settled loop so the traced faces are well-formed.
@@ -667,7 +698,7 @@ enum class AppState { Menu, Playing };
 
 int main() {
     InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, "The Unpinning Game");
-    SetTargetFPS(120);
+    SetTargetFPS(60);
 
     AppState  state = AppState::Menu;
     StartMenu menu;
