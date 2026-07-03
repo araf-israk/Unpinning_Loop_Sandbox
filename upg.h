@@ -69,6 +69,13 @@ const float SPRING_CONSTANT = 1.0f;
 const float K_SMOOTH = 0.20f;
 const float EDGE_TENSION_SCALE = 0.90f;
 
+// Target even spacing for ResampleArcsEven: each arc is resampled (beads added OR
+// removed) to round(arcLength / ARC_EVEN_SPACING) - 1 beads, so a too-sparse arc
+// fills in and an over-packed one sheds beads, both landing at even spacing. Set
+// to the tension equilibrium (EDGE_TENSION_SCALE * REST_LENGTH) so the resampled
+// count matches what the springs want and the two don't fight. Larger = sparser.
+const float ARC_EVEN_SPACING = REST_LENGTH * EDGE_TENSION_SCALE;
+
 const float COLLISION_STIFFNESS = 1.0f;
 const float INTEGRATION_STEP = 0.15f;
 const float CENTER_SPEED = 0.15f;
@@ -119,8 +126,20 @@ const int   BIGON_MIN_BEADS = 6;
 // Overlap thinning: two CONSECUTIVE edge beads on the same arc closer than this are
 // redundant and the excess is spliced out -- but never below the arc's own floor,
 // so thinning can't fight the padding above. Well under REST_LENGTH, so normally
-// spaced beads are kept; this only catches piles/overlaps left by surgery.
-const float BEAD_OVERLAP_DIST = REST_LENGTH * 0.9f;
+// spaced beads (tension holds them near 0.9 * REST_LENGTH) are kept; this only
+// catches genuine piles/overlaps. Also sets how small a gap the fill pass can
+// close: the fill threshold below is 2.2x this, so a lower value lets smaller gaps
+// be filled (at the cost of gentler pile removal).
+const float BEAD_OVERLAP_DIST = REST_LENGTH * 0.6f;
+
+// Gap filling: when the length springs stretch a link between two edge beads past
+// this, ResampleStretchedArcs inserts a bead at its midpoint (NormalizeArcBeads
+// only pads to a bead-count floor, so it never fills a gap on a long, sparse arc).
+// Kept above 2 * BEAD_OVERLAP_DIST (with a margin) so each midpoint half lands
+// farther than the thinning distance and is not immediately removed again -- so
+// filling and thinning can't oscillate. Lower BOTH this and BEAD_OVERLAP_DIST
+// together if you want smaller gaps filled.
+const float ARC_MAX_LINK = 2.2f * BEAD_OVERLAP_DIST;
 
 // Hard non-overlap. The self-avoidance force above is a soft penalty that the
 // displacement clamp can cap, so deep overlaps still leak through. After every
@@ -132,7 +151,7 @@ const float BEAD_OVERLAP_DIST = REST_LENGTH * 0.9f;
 // passing nearby is still separated). Min centre separation is one bead diameter;
 // a few Gauss-Seidel sweeps per substep clear even tight clusters.
 const float BEAD_MIN_SEP = REST_LENGTH;   // = 2 * RADIUS: disks just touch, never overlap
-const int   OVERLAP_RESOLVE_ITERS = 3;    // sweeps per substep; more clears tight clusters faster
+const int   OVERLAP_RESOLVE_ITERS = 5;    // sweeps per substep; more clears tight clusters faster
 
 // Pins settle by repulsion balance: pushed away from every nearby strand bead
 // and crossing, a pin sits at the open centre of its face and cannot drift past
@@ -362,6 +381,7 @@ struct LoopModel {
     int  ArcMinTarget(int crossingBeadIdx, int slot, int otherCrossing) const; // face-aware bead floor for one arc
     int  NormalizeArcBeads(float overlapDist);// per arc: pad up to the face floor, then thin overlaps; returns net edits
     int  ResampleStretchedArcs(float maxLen); // split every over-long edge link; returns count
+    int  ResampleArcsEven(float spacing);     // per arc: add/remove to an even, length-based bead count; returns net edits
     int  RemoveEdgeBead(int b);               // splice an edge bead out, relinking its two neighbors
     int  SimplifyDenseArcs(float touchLen, float minAngleDeg); // drop kinked/piled beads; returns count
 

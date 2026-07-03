@@ -560,7 +560,14 @@ struct GameState {
                 // thinning AND padding in one floor-respecting pass, so the two never
                 // oscillate. It also enforces the monogon / bigon minimums.
                 model.SimplifyDenseArcs(0.0f, MIN_ARC_ANGLE_DEG);
-                if (!model.r3Active) model.NormalizeArcBeads(BEAD_OVERLAP_DIST);
+                if (!model.r3Active) {
+                    model.NormalizeArcBeads(BEAD_OVERLAP_DIST);
+                    // Even-spacing resample: fills sparse arcs AND thins over-packed
+                    // ones to a length-based bead count, so a single arc can't stay
+                    // way too long. Count-targeted, so it can't oscillate with itself
+                    // or the tension. Skipped mid-R3-walk (fixed bead indices).
+                    model.ResampleArcsEven(ARC_EVEN_SPACING);
+                }
                 // Recompute regions from the live diagram and keep exactly one pin
                 // per bounded region, each inside it. Runs only on a fully clean,
                 // settled loop so the traced faces are well-formed.
@@ -577,7 +584,7 @@ struct GameState {
         DrawInterface(tension, autoRun);
         DrawPins(model);
         DrawWireSpline(model);
-        //Draw_Debug_Screen(model);
+        Draw_Debug_Screen(model);
         EndDrawing();
     }
 };

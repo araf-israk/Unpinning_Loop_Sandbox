@@ -450,6 +450,98 @@ int LoopModel::ResampleStretchedArcs(float maxLen) {
     return (int)toSplit.size();
 }
 
+// Even-spacing resample. Unlike the two threshold passes above (which only add
+// past maxLen or thin within overlapDist, leaving a wide band where an arc can sit
+// over-packed), this drives each arc to a length-based bead COUNT and so removes
+// packing as readily as it fills gaps -- both toward even `spacing`. Targeting a
+// count (not a spacing threshold) makes it oscillation-free: a removal/insertion
+// barely changes the arc length, so the target is stable frame to frame. Never
+// drops below the arc's face-aware floor (ArcMinTarget), and only removes INTERIOR
+// beads, so arc endpoints stay adjacent to their crossings. Skips transitions.
+int LoopModel::ResampleArcsEven(float spacing) {
+    if (spacing <= GEOM_EPS) return 0;
+    int changed = 0;
+
+    std::vector<int> crossings;
+    for (int i = 0; i < (int)beads.size(); ++i)
+        if (beads[i].active && beads[i].isVertex) crossings.push_back(i);
+
+    for (int ci : crossings) {
+        for (int s = 0; s < 4; ++s) {
+            if (!beads[ci].active || !beads[ci].isVertex) break;
+            if (beads[ci].neighborOfSlot[s] < 0) continue;
+
+            ArcWalk w = WalkFromSlot(ci, s);
+            int other = w.endVertex;
+            if (other < 0) continue;
+
+            bool transitioning = false;
+            for (int b : w.beads) if (transitions.count(b)) { transitioning = true; break; }
+            if (transitioning) continue;
+
+            // Handle each arc once (from its lower (crossing,slot) end).
+            int want = w.beads.empty() ? ci : w.beads.back();
+            int entry = -1;
+            for (int t = 0; t < 4; ++t) if (beads[other].neighborOfSlot[t] == want) { entry = t; break; }
+            if (entry >= 0) {
+                long long a = (long long)ci * 4 + s, b = (long long)other * 4 + entry;
+                if (a > b) continue;
+            }
+
+            // Polyline length ci -> beads -> other, and the target even count.
+            float len = 0.0f; int prev = ci;
+            for (int b : w.beads) {
+                len += std::hypot(beads[b].pos.x - beads[prev].pos.x,
+                    beads[b].pos.y - beads[prev].pos.y); prev = b;
+            }
+            len += std::hypot(beads[other].pos.x - beads[prev].pos.x,
+                beads[other].pos.y - beads[prev].pos.y);
+            int N = (int)std::lround(len / spacing) - 1;
+            int floorN = ArcMinTarget(ci, s, other);
+            if (N < floorN) N = floorN;
+            if (N < 2) N = 2;
+
+            // ADD up to N: split the longest link each pass.
+            int guard = 0;
+            while ((int)w.beads.size() < N && guard++ < N + 8) {
+                std::vector<int> nodes; nodes.reserve(w.beads.size() + 2);
+                nodes.push_back(ci);
+                for (int b : w.beads) nodes.push_back(b);
+                nodes.push_back(other);
+                int bestI = -1; float bestLen2 = -1.0f;
+                for (int i = 0; i + 1 < (int)nodes.size(); ++i) {
+                    if (nodes[i] == nodes[i + 1]) continue;
+                    Vector2 p = beads[nodes[i]].pos, q = beads[nodes[i + 1]].pos;
+                    float d2 = (p.x - q.x) * (p.x - q.x) + (p.y - q.y) * (p.y - q.y);
+                    if (d2 > bestLen2) { bestLen2 = d2; bestI = i; }
+                }
+                if (bestI < 0) break;
+                int m = SpliceBeadBetween(nodes[bestI], nodes[bestI + 1]);
+                if (m < 0) break;
+                ++changed;
+                w = WalkFromSlot(ci, s);
+            }
+
+            // REMOVE down to N: drop the interior bead whose two arc-neighbours are
+            // closest (the densest spot), so the survivors stay evenly spaced.
+            guard = 0;
+            while ((int)w.beads.size() > N && guard++ < 100000) {
+                int bestIdx = -1; float bestSpan2 = 1e30f;
+                for (int i = 1; i + 1 < (int)w.beads.size(); ++i) {
+                    Vector2 p = beads[w.beads[i - 1]].pos, q = beads[w.beads[i + 1]].pos;
+                    float d2 = (p.x - q.x) * (p.x - q.x) + (p.y - q.y) * (p.y - q.y);
+                    if (d2 < bestSpan2) { bestSpan2 = d2; bestIdx = i; }
+                }
+                if (bestIdx < 0) break;
+                if (RemoveEdgeBead(w.beads[bestIdx]) < 0) break;
+                ++changed;
+                w = WalkFromSlot(ci, s);
+            }
+        }
+    }
+    return changed;
+}
+
 // Splice a redundant edge bead out: its two strand-neighbours are linked directly
 // and it is deactivated. Only edge beads are removed; vertices are never touched.
 // Refuses cases that would corrupt the strand (a lone neighbour, a 2-cycle, or a
