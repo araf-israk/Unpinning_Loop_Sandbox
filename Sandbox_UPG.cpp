@@ -46,8 +46,16 @@ struct GameState {
     Vector2   dragOffset = { 0.0f, 0.0f };
 
     bool                     autoRun = false;
+    bool                     showR3Debug = true;   // F3: draw the trigon-containment overlay
     std::vector<CollapseJob> jobs;
     std::set<int>            pending;
+
+    // ---- solver-smoothness bookkeeping (Jacobi projection + sleep gating) --
+    float lastStepMaxDisp = 0.0f;      // max bead motion in the most recent Step (px)
+    float lastOverlapMaxDisp = 0.0f;   // max positional correction applied by ResolveOverlaps
+    float lastPinMaxDisp = 0.0f;       // max pin motion in the most recent SettlePins
+    bool  asleep = false;              // true => whole simulation is frozen at rest
+    int   quietFrames = 0;             // consecutive frames whose motion was below SLEEP_EPSILON
 
     // ---- frame-delayed callbacks -----------------------------------------
     // A function scheduled to fire some number of frames (Update calls) later.
@@ -211,16 +219,30 @@ struct GameState {
 
         // 5. integrate, clamping per-substep displacement for stability
         const float maxD2 = MAX_DISPLACEMENT * MAX_DISPLACEMENT;
+        float intMax2 = 0.0f;   // largest bead move this substep (for sleep gating)
         for (auto& b : model.beads) {
             if (!b.active || b.driven) continue;
             float dx = b.force.x * INTEGRATION_STEP, dy = b.force.y * INTEGRATION_STEP;
             float m2 = dx * dx + dy * dy;
             if (m2 > maxD2) { float s = MAX_DISPLACEMENT / std::sqrt(m2); dx *= s; dy *= s; }
             b.pos.x += dx; b.pos.y += dy;
+            float applied2 = dx * dx + dy * dy;
+            if (applied2 > intMax2) intMax2 = applied2;
         }
 
         // 6. hard non-overlap projection (runs last so the substep ends separated)
+        lastOverlapMaxDisp = 0.0f;
         if (!collisionsOff) ResolveOverlaps(OVERLAP_RESOLVE_ITERS);
+
+        // 6b. trigon containment: during an R3 walk, eject any outer strand that
+        // has drifted inside the flipping triangle. Runs after the overlap pass so
+        // it has the final say and the substep ends with the region empty.
+        if (model.r3Active) model.KeepOutOfTrigon(BEAD_MIN_SEP);
+
+        // Motion gauge for sleep gating: the larger of this substep's integration
+        // move and the projection's correction. (KeepOutOfTrigon only runs during
+        // an R3 walk, which is "busy" anyway, so it needn't be measured here.)
+        lastStepMaxDisp = std::max(std::sqrt(intMax2), lastOverlapMaxDisp);
     }
 
     // Hard non-overlap: push every pair of nearby beads apart until their disks
@@ -251,54 +273,133 @@ struct GameState {
             return ((int64_t)ix << 32) ^ (int64_t)(uint32_t)iy;
             };
 
-        for (int it = 0; it < iters; ++it) {
-            std::unordered_map<int64_t, std::vector<int>> grid;
-            grid.reserve(model.beads.size() * 2);
-            for (int i = 0; i < (int)model.beads.size(); ++i) {
-                if (!model.beads[i].active || model.transitions.count(i)) continue;
-                int ix = (int)std::floor(model.beads[i].pos.x / cell);
-                int iy = (int)std::floor(model.beads[i].pos.y / cell);
-                grid[key(ix, iy)].push_back(i);
-            }
+        const int NB = (int)model.beads.size();
+        float maxCorr2 = 0.0f;   // largest position correction applied (for sleep gating)
 
-            bool moved = false;
-            for (int i = 0; i < (int)model.beads.size(); ++i) {
-                Bead& bi = model.beads[i];
-                if (!bi.active || model.transitions.count(i)) continue;
-                int ix = (int)std::floor(bi.pos.x / cell);
-                int iy = (int)std::floor(bi.pos.y / cell);
-                for (int gx = ix - 1; gx <= ix + 1; ++gx)
-                    for (int gy = iy - 1; gy <= iy + 1; ++gy) {
-                        auto it = grid.find(key(gx, gy));
-                        if (it == grid.end()) continue;
-                        for (int j : it->second) {
-                            if (j <= i) continue;
-                            Bead& bj = model.beads[j];
-                            float dx = bj.pos.x - bi.pos.x, dy = bj.pos.y - bi.pos.y;
-                            float d2 = dx * dx + dy * dy;
-                            if (d2 >= minSep2) continue;
-                            if (Adjacent(model, i, j)) continue;
-                            if (sharesCrossing(i, j)) continue;
-
-                            float d = std::sqrt(d2);
-                            if (d < GEOM_EPS) {
-                                std::uniform_real_distribution<float> jit(-1.0f, 1.0f);
-                                dx = jit(model.rng); dy = jit(model.rng); d = std::hypot(dx, dy);
-                                if (d < GEOM_EPS) { dx = 1.0f; dy = 0.0f; d = 1.0f; }
-                            }
-                            float pen = minSep - d, ux = dx / d, uy = dy / d;
-                            bool ai = bi.isVertex || bi.driven;
-                            bool aj = bj.isVertex || bj.driven;
-                            float wi = ai ? 0.0f : (aj ? 1.0f : 0.5f);
-                            float wj = aj ? 0.0f : (ai ? 1.0f : 0.5f);
-                            bi.pos.x -= ux * pen * wi; bi.pos.y -= uy * pen * wi;
-                            bj.pos.x += ux * pen * wj; bj.pos.y += uy * pen * wj;
-                            moved = true;
-                        }
-                    }
-            }
-            if (!moved) break;
+        // The spatial hash is rebuilt ONCE per call, not once per sweep. This
+        // function already runs once per substep (10x / frame), so cell
+        // membership is refreshed 10x / frame regardless; the under-relaxed
+        // per-sweep moves are far smaller than a cell, so reusing the hash across
+        // this call's few sweeps stays correct while dropping ~iters-1 O(N) rebuilds.
+        std::unordered_map<int64_t, std::vector<int>> grid;
+        grid.reserve(NB * 2);
+        for (int i = 0; i < NB; ++i) {
+            if (!model.beads[i].active || model.transitions.count(i)) continue;
+            int ix = (int)std::floor(model.beads[i].pos.x / cell);
+            int iy = (int)std::floor(model.beads[i].pos.y / cell);
+            grid[key(ix, iy)].push_back(i);
         }
+
+        if (USE_JACOBI_OVERLAP) {
+            // Jacobi: gather every pair's correction into per-bead accumulators,
+            // then apply the average (scaled by OVERLAP_RELAX) after the whole
+            // sweep. Order-independent, so no residual index-order bias; averaging
+            // by contact count stops a bead with many simultaneous contacts from
+            // being flung; OVERLAP_RELAX < 1 keeps the pass from overshooting into
+            // oscillation -- squeezed beads ease apart over a few sweeps.
+            std::vector<Vector2> acc(NB, { 0.0f, 0.0f });
+            std::vector<int>     contacts(NB, 0);
+
+            for (int it = 0; it < iters; ++it) {
+                for (int i = 0; i < NB; ++i) { acc[i] = { 0.0f, 0.0f }; contacts[i] = 0; }
+
+                bool anyContact = false;
+                for (int i = 0; i < NB; ++i) {
+                    Bead& bi = model.beads[i];
+                    if (!bi.active || model.transitions.count(i)) continue;
+                    int ix = (int)std::floor(bi.pos.x / cell);
+                    int iy = (int)std::floor(bi.pos.y / cell);
+                    for (int gx = ix - 1; gx <= ix + 1; ++gx)
+                        for (int gy = iy - 1; gy <= iy + 1; ++gy) {
+                            auto git = grid.find(key(gx, gy));
+                            if (git == grid.end()) continue;
+                            for (int j : git->second) {
+                                if (j <= i) continue;
+                                Bead& bj = model.beads[j];
+                                float dx = bj.pos.x - bi.pos.x, dy = bj.pos.y - bi.pos.y;
+                                float d2 = dx * dx + dy * dy;
+                                if (d2 >= minSep2) continue;
+                                if (Adjacent(model, i, j)) continue;
+                                if (sharesCrossing(i, j)) continue;
+
+                                float d = std::sqrt(d2);
+                                if (d < GEOM_EPS) {
+                                    std::uniform_real_distribution<float> jit(-1.0f, 1.0f);
+                                    dx = jit(model.rng); dy = jit(model.rng); d = std::hypot(dx, dy);
+                                    if (d < GEOM_EPS) { dx = 1.0f; dy = 0.0f; d = 1.0f; }
+                                }
+                                float pen = minSep - d, ux = dx / d, uy = dy / d;
+                                bool ai = bi.isVertex || bi.driven;
+                                bool aj = bj.isVertex || bj.driven;
+                                float wi = ai ? 0.0f : (aj ? 1.0f : 0.5f);
+                                float wj = aj ? 0.0f : (ai ? 1.0f : 0.5f);
+                                acc[i].x -= ux * pen * wi; acc[i].y -= uy * pen * wi;
+                                acc[j].x += ux * pen * wj; acc[j].y += uy * pen * wj;
+                                ++contacts[i]; ++contacts[j];
+                                anyContact = true;
+                            }
+                        }
+                }
+                if (!anyContact) break;
+
+                for (int i = 0; i < NB; ++i) {
+                    if (contacts[i] == 0) continue;
+                    float inv = OVERLAP_RELAX / (float)contacts[i];
+                    float mx = acc[i].x * inv, my = acc[i].y * inv;
+                    model.beads[i].pos.x += mx; model.beads[i].pos.y += my;
+                    float m2 = mx * mx + my * my;
+                    if (m2 > maxCorr2) maxCorr2 = m2;
+                }
+            }
+        }
+        else {
+            // Legacy Gauss-Seidel: correct each pair in place, in bead-index order.
+            for (int it = 0; it < iters; ++it) {
+                bool moved = false;
+                for (int i = 0; i < NB; ++i) {
+                    Bead& bi = model.beads[i];
+                    if (!bi.active || model.transitions.count(i)) continue;
+                    int ix = (int)std::floor(bi.pos.x / cell);
+                    int iy = (int)std::floor(bi.pos.y / cell);
+                    for (int gx = ix - 1; gx <= ix + 1; ++gx)
+                        for (int gy = iy - 1; gy <= iy + 1; ++gy) {
+                            auto git = grid.find(key(gx, gy));
+                            if (git == grid.end()) continue;
+                            for (int j : git->second) {
+                                if (j <= i) continue;
+                                Bead& bj = model.beads[j];
+                                float dx = bj.pos.x - bi.pos.x, dy = bj.pos.y - bi.pos.y;
+                                float d2 = dx * dx + dy * dy;
+                                if (d2 >= minSep2) continue;
+                                if (Adjacent(model, i, j)) continue;
+                                if (sharesCrossing(i, j)) continue;
+
+                                float d = std::sqrt(d2);
+                                if (d < GEOM_EPS) {
+                                    std::uniform_real_distribution<float> jit(-1.0f, 1.0f);
+                                    dx = jit(model.rng); dy = jit(model.rng); d = std::hypot(dx, dy);
+                                    if (d < GEOM_EPS) { dx = 1.0f; dy = 0.0f; d = 1.0f; }
+                                }
+                                float pen = minSep - d, ux = dx / d, uy = dy / d;
+                                bool ai = bi.isVertex || bi.driven;
+                                bool aj = bj.isVertex || bj.driven;
+                                float wi = ai ? 0.0f : (aj ? 1.0f : 0.5f);
+                                float wj = aj ? 0.0f : (ai ? 1.0f : 0.5f);
+                                float mix = ux * pen * wi, miy = uy * pen * wi;
+                                float mjx = ux * pen * wj, mjy = uy * pen * wj;
+                                bi.pos.x -= mix; bi.pos.y -= miy;
+                                bj.pos.x += mjx; bj.pos.y += mjy;
+                                float m2 = std::max(mix * mix + miy * miy, mjx * mjx + mjy * mjy);
+                                if (m2 > maxCorr2) maxCorr2 = m2;
+                                moved = true;
+                            }
+                        }
+                }
+                if (!moved) break;
+            }
+        }
+
+        lastOverlapMaxDisp = std::sqrt(maxCorr2);
     }
 
     // Settle each pin at the open centre of its face by repulsion balance.
@@ -311,6 +412,7 @@ struct GameState {
         const float R2s = PIN_SETTLE_RANGE * PIN_SETTLE_RANGE;
         const float PPs = PIN_PIN_RANGE * PIN_PIN_RANGE;
         const float maxStep2 = PIN_MAX_STEP * PIN_MAX_STEP;
+        float pinMax2 = 0.0f;   // largest pin move this pass (for sleep gating)
 
         for (auto& pin : model.pins) {
             if (!pin.active) continue;
@@ -346,7 +448,10 @@ struct GameState {
             float m2 = dx * dx + dy * dy;
             if (m2 > maxStep2) { float s = PIN_MAX_STEP / std::sqrt(m2); dx *= s; dy *= s; }
             pin.pos.x += dx; pin.pos.y += dy;
+            float applied2 = dx * dx + dy * dy;
+            if (applied2 > pinMax2) pinMax2 = applied2;
         }
+        lastPinMaxDisp = std::sqrt(pinMax2);
     }
 
     // ---- smooth removal ---------------------------------------------------
@@ -516,6 +621,7 @@ struct GameState {
     // ---- input ------------------------------------------------------------
 
     void HandleInput(Vector2 mouse) {
+        if (IsKeyPressed(KEY_F3)) showR3Debug = !showR3Debug;
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
             bool onBtn = mouse.x > SCREEN_WIDTH / 2 - 110 && mouse.x < SCREEN_WIDTH / 2 + 110 &&
                 mouse.y > 32 && mouse.y < 68;
@@ -546,7 +652,29 @@ struct GameState {
 
     void Update(Vector2 mouse) {
         HandleInput(mouse);
-        for (int s = 0; s < UPDATES_PER_FRAME; ++s) Step();
+
+        // ---- sleep gating -----------------------------------------------------
+        // A settled diagram never reaches an exact fixed point, so integrating it
+        // forever leaves it micro-vibrating at the float-noise floor. Freeze the
+        // whole simulation once it has been at rest (bead AND pin motion under
+        // SLEEP_EPSILON) for SLEEP_FRAMES consecutive frames with nothing in
+        // flight. Anything that can move the loop -- a drag, a click-scheduled
+        // move, a running collapse job, a live rest-length transition, an R3 walk,
+        // auto-tighten, or just a held mouse button -- counts as activity and wakes
+        // it the same frame (before the early-out below).
+        const bool busy =
+            dragging >= 0 || !delayedTasks.empty() || !jobs.empty() ||
+            !pending.empty() || !model.transitions.empty() ||
+            autoRun || model.r3Active;
+        if (busy || IsMouseButtonDown(MOUSE_BUTTON_LEFT)) { asleep = false; quietFrames = 0; }
+
+        if (SLEEP_ENABLE && asleep) return;   // frozen: skip physics, resampling, pins
+
+        float frameMax = 0.0f;
+        for (int s = 0; s < UPDATES_PER_FRAME; ++s) {
+            Step();
+            frameMax = std::max(frameMax, lastStepMaxDisp);
+        }
         TickTransitions();
         TickDelays();
         AutoTick();
@@ -574,6 +702,16 @@ struct GameState {
                 ReconcilePins(model, true);
             }
             SettlePins();
+            frameMax = std::max(frameMax, lastPinMaxDisp);
+        }
+
+        // Fall asleep only after the loop has stayed quiet for SLEEP_FRAMES frames
+        // and nothing is animating; any motion or activity resets the counter.
+        if (SLEEP_ENABLE && !busy && frameMax < SLEEP_EPSILON) {
+            if (++quietFrames >= SLEEP_FRAMES) asleep = true;
+        }
+        else {
+            quietFrames = 0;
         }
     }
 
@@ -584,6 +722,7 @@ struct GameState {
         DrawInterface(tension, autoRun);
         DrawPins(model);
         DrawWireSpline(model);
+        if (showR3Debug) DrawR3Debug(model);
         Draw_Debug_Screen(model);
         EndDrawing();
     }

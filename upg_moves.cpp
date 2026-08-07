@@ -58,6 +58,26 @@ namespace {
         b.pos.x = junction.x + nx * delta;
         b.pos.y = junction.y + ny * delta;
     }
+
+    // Even-odd point-in-polygon test.
+    bool PtInPolyLocal(Vector2 p, const std::vector<Vector2>& poly) {
+        bool in = false; size_t n = poly.size();
+        for (size_t i = 0, j = n - 1; i < n; j = i++)
+            if (((poly[i].y > p.y) != (poly[j].y > p.y)) &&
+                (p.x < (poly[j].x - poly[i].x) * (p.y - poly[i].y) / (poly[j].y - poly[i].y) + poly[i].x))
+                in = !in;
+        return in;
+    }
+
+    // Closest point on segment a-b to p; writes the squared distance to d2out.
+    Vector2 ClosestOnSeg(Vector2 p, Vector2 a, Vector2 b, float& d2out) {
+        float vx = b.x - a.x, vy = b.y - a.y, wx = p.x - a.x, wy = p.y - a.y;
+        float c1 = vx * wx + vy * wy, c2 = vx * vx + vy * vy;
+        float t = (c2 > GEOM_EPS) ? c1 / c2 : 0.0f;
+        if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
+        Vector2 q = { a.x + t * vx, a.y + t * vy };
+        float dx = p.x - q.x, dy = p.y - q.y; d2out = dx * dx + dy * dy; return q;
+    }
 } // namespace
 
 
@@ -578,6 +598,72 @@ void LoopModel::ApplyStemNormalForces(Vector2 center, float k) {
         float tX = J.pos.x + nx * sl, tY = J.pos.y + ny * sl;   // same radius, on the normal
         beads[stem].force.x += (tX - beads[stem].pos.x) * k;
         beads[stem].force.y += (tY - beads[stem].pos.y) * k;
+
+        // Option 1: walk the outer leg past the stem and hold each bead on the
+        // outward side of the bar line through J. One-sided -- only a bead that has
+        // drifted to the inward (centroid) side is pushed out -- with per-hop
+        // falloff, so legs already outside keep their natural shape. This is what
+        // stops the leg (not just the stem) from sweeping across the trigon.
+        int prev = i, cur = stem;
+        for (int h = 1; h <= R3_STEM_LEG_SPAN; ++h) {
+            const Bead& C = beads[cur];
+            if (C.isVertex) break;
+            int nxt = (C.neighbors[0] == prev) ? C.neighbors[1] : C.neighbors[0];
+            if (nxt < 0 || nxt >= (int)beads.size() || !beads[nxt].active || beads[nxt].isVertex) break;
+            float d = (beads[nxt].pos.x - J.pos.x) * nx + (beads[nxt].pos.y - J.pos.y) * ny;  // + = outward of bar line
+            if (d < R3_STEM_LEG_MARGIN) {
+                float w = 1.0f - float(h) / float(R3_STEM_LEG_SPAN + 1);   // closest leg beads held strongest
+                float push = (R3_STEM_LEG_MARGIN - d) * k * w;
+                beads[nxt].force.x += nx * push;
+                beads[nxt].force.y += ny * push;
+            }
+            prev = cur; cur = nxt;
+        }
+    }
+}
+
+// Hard containment for the animated R3 walk: the trigon face (boundary =
+// r3Ring, the corners + arc beads captured at move start) must stay empty, so
+// any active bead that is NOT on that boundary and falls inside the polygon is
+// projected out past its nearest edge (+ margin), pushed radially away from the
+// centroid r3Center. This is what holds the outer-leg stems -- the strands that
+// would otherwise be dragged across the region and clip through the arcs --
+// outside the triangle for the whole walk. Anchors (crossings, dragged beads)
+// and beads in a collapse transition are left in place, matching the exemptions
+// ResolveOverlaps uses, so the two positional passes never fight the same bead.
+// The migrating junctions are themselves ring beads and so are exempt; only
+// their branch strands get pushed out. Call once per physics substep while
+// r3Active; inert otherwise.
+void LoopModel::KeepOutOfTrigon(float margin) {
+    r3Ejected.clear();
+    if (!r3Active || r3Ring.size() < 3) return;
+
+    std::vector<Vector2> poly; poly.reserve(r3Ring.size());
+    std::vector<char> onRing(beads.size(), 0);
+    for (int b : r3Ring)
+        if (b >= 0 && b < (int)beads.size() && beads[b].active) { poly.push_back(beads[b].pos); onRing[b] = 1; }
+    if (poly.size() < 3) return;
+
+    const size_t n = poly.size();
+    for (int i = 0; i < (int)beads.size(); ++i) {
+        Bead& p = beads[i];
+        if (!p.active || onRing[i]) continue;
+        if (p.isVertex || p.driven || transitions.count(i)) continue;   // immovable / mid-collapse: skip (see ResolveOverlaps)
+        if (!PtInPolyLocal(p.pos, poly)) continue;
+
+        // Nearest boundary edge, then re-seat p just outside it.
+        float best2 = 1e30f; Vector2 bestQ = p.pos;
+        for (size_t a = 0, b = n - 1; a < n; b = a++) {
+            float d2; Vector2 q = ClosestOnSeg(p.pos, poly[b], poly[a], d2);
+            if (d2 < best2) { best2 = d2; bestQ = q; }
+        }
+        float ox = bestQ.x - r3Center.x, oy = bestQ.y - r3Center.y;   // outward = away from centroid
+        float L = std::hypot(ox, oy);
+        if (L <= GEOM_EPS) { ox = p.pos.x - r3Center.x; oy = p.pos.y - r3Center.y; L = std::hypot(ox, oy); }
+        if (L <= GEOM_EPS) continue;
+        p.pos.x = bestQ.x + ox / L * margin;
+        p.pos.y = bestQ.y + oy / L * margin;
+        r3Ejected.push_back(i);
     }
 }
 
@@ -754,6 +840,18 @@ void LoopModel::Perform_R3_Walk_S3(int V0, int V1, int V2, FaceClass& f, std::fu
     r3Center = { (beads[V0].pos.x + beads[V1].pos.x + beads[V2].pos.x) / 3.0f,
                  (beads[V0].pos.y + beads[V1].pos.y + beads[V2].pos.y) / 3.0f };
     r3Active = true;
+    // Boundary cycle V0 -> arc0 -> V1 -> arc1 -> V2 -> arc2 (triArcs are stored
+    // c_k -> c_{k+1}, so this concatenation is a simple loop). The corners demote
+    // to bar beads and the junctions walk along the arcs, but every index here
+    // stays a live boundary bead, so KeepOutOfTrigon can rebuild the polygon from
+    // current positions each substep.
+    r3Ring.clear();
+    r3Ring.push_back(V0);
+    r3Ring.insert(r3Ring.end(), f.triArcs[0].begin(), f.triArcs[0].end());
+    r3Ring.push_back(V1);
+    r3Ring.insert(r3Ring.end(), f.triArcs[1].begin(), f.triArcs[1].end());
+    r3Ring.push_back(V2);
+    r3Ring.insert(r3Ring.end(), f.triArcs[2].begin(), f.triArcs[2].end());
     Perform_R3_Walk_S1(V0, slotForArc(V0, f.triArcs[0]), slotForArc(V0, f.triArcs[2]), f.triArcs[0], f.triArcs[2], schedule);
     Perform_R3_Walk_S1(V1, slotForArc(V1, f.triArcs[0]), slotForArc(V1, f.triArcs[1]), f.triArcs[0], f.triArcs[1], schedule);
     Perform_R3_Walk_S1(V2, slotForArc(V2, f.triArcs[2]), slotForArc(V2, f.triArcs[1]), f.triArcs[2], f.triArcs[1], schedule);
@@ -780,7 +878,12 @@ void LoopModel::Perform_R3_Walk_S3(int V0, int V1, int V2, FaceClass& f, std::fu
             lastMerge = std::max(lastMerge, when);
             schedule(when, [mergeArc, arc] { mergeArc(arc); });
         }
-        schedule(lastMerge + R3_WALK_GAP, [this] { RebuildCrossingList(); r3Active = false; });
+        // Topology is final one gap after the last merge; keep r3Active (and so
+        // the trigon containment) running a few extra gaps so anything still
+        // trapped inside is expelled during the post-merge settle, not left
+        // clipped when the flag drops.
+        schedule(lastMerge + R3_WALK_GAP, [this] { RebuildCrossingList(); });
+        schedule(lastMerge + 8 * R3_WALK_GAP, [this] { r3Active = false; r3Ring.clear(); });
     }
     else {
         mergeArc(f.triArcs[0]);
@@ -788,6 +891,7 @@ void LoopModel::Perform_R3_Walk_S3(int V0, int V1, int V2, FaceClass& f, std::fu
         mergeArc(f.triArcs[2]);
         RebuildCrossingList();
         r3Active = false;
+        r3Ring.clear();
     }
 }
 

@@ -153,6 +153,26 @@ const float ARC_MAX_LINK = 2.2f * BEAD_OVERLAP_DIST;
 const float BEAD_MIN_SEP = REST_LENGTH;   // = 2 * RADIUS: disks just touch, never overlap
 const int   OVERLAP_RESOLVE_ITERS = 5;    // sweeps per substep; more clears tight clusters faster
 
+// ---- overlap projection: Jacobi + under-relaxation (anti-jitter) -----------
+// The old projection wrote each correction in place (Gauss-Seidel), so the fix a
+// bead received depended on bead index order and it never fully settled -- a
+// residual, order-biased push that buzzed against the length springs. The Jacobi
+// path accumulates every pair's correction, then applies the per-bead AVERAGE
+// scaled by OVERLAP_RELAX < 1, so squeezed beads glide apart symmetrically
+// instead of oscillating. Set USE_JACOBI_OVERLAP=false for the legacy path.
+const bool  USE_JACOBI_OVERLAP = true;
+const float OVERLAP_RELAX = 0.5f;   // under-relaxation (0<w<=1); lower = smoother, needs more iters
+
+// ---- sleep gating (anti-jitter) --------------------------------------------
+// A settled loop never reaches an exact fixed point, so integrating it forever
+// leaves it micro-vibrating at the float-noise floor. When bead AND pin motion
+// stay under SLEEP_EPSILON px for SLEEP_FRAMES consecutive frames with nothing
+// animating, freeze the simulation until an interaction wakes it. SLEEP_EPSILON
+// is a per-frame max-displacement threshold; well below one pixel is invisible.
+const bool  SLEEP_ENABLE = true;
+const float SLEEP_EPSILON = 0.08f;
+const int   SLEEP_FRAMES = 12;
+
 // Pins settle by repulsion balance: pushed away from every nearby strand bead
 // and crossing, a pin sits at the open centre of its face and cannot drift past
 // a bounding strand (moving toward a wall only increases that wall's push).
@@ -177,7 +197,7 @@ const int   R3_SLIDE_FRAMES = 58;       // guided flip into the clean layout
 const int   R3_GROW_FRAMES = 54;
 const int   MORPH_FRAMES = 140;      // R3 morph: crossings slide to the arc midpoints (slow, so the merge reads clearly)
 
-const int   R3_WALK_GAP = 10;       // frames between T-junction hops during the R3 walk (shared by walk + merge timing)
+const int   R3_WALK_GAP = 5;       // frames between T-junction hops during the R3 walk (shared by walk + merge timing)
 
 // Before an R3 walk, each of the three triangle arcs is padded up to this many
 // edge beads (spread on its longest links). More beads => more, smaller hops =>
@@ -220,8 +240,16 @@ const float R3_STEM_NORMAL_LEN = 1.0f * REST_LENGTH;   // per-hop / per-merge no
 // If the one-shot placement above is tugged back by the springs before the next
 // hop, ApplyStemNormalForces adds a standing per-substep angular spring holding the
 // stem on the bar normal. Start soft so it biases without fighting the edge springs.
-const bool  R3_NORMAL_STEM_SPRING = false;         // Option 3b: continuous angular hold
+const bool  R3_NORMAL_STEM_SPRING = true;          // Option 3b: continuous angular hold (Option-1 leg-hold rides on this)
 const float R3_STEM_NORMAL_K = 0.15f;              // angular-spring stiffness (Option 3b)
+
+// Option 1: past the stem bead, also hold the first R3_STEM_LEG_SPAN beads of the
+// outer LEG on the outward side of the junction's arc, so the whole leg -- not
+// just the stem -- is kept out of the trigon. One-sided (only a leg bead that has
+// drifted inward is pushed) with per-hop falloff, so it biases the leg outward
+// without straightening it. KeepOutOfTrigon stays as a hard backstop.
+const int   R3_STEM_LEG_SPAN = 5;                  // leg beads past the stem to hold (0 = stem only)
+const float R3_STEM_LEG_MARGIN = RADIUS;           // clearance the leg keeps outside its arc line
 
 // ----- Smooth-transition toggles for the manual (pin-click) R-moves -----
 // R1 + R2: route the click through the SAME shrink-to-zero collapse the auto-
@@ -237,7 +265,7 @@ const bool  R3_EASE_HOPS = false;
 // R1 monogon collapse eats the self-loop one edge bead at a time; this is the
 // frame gap between successive bead removals (the loop visibly retracts into
 // the crossing, then the crossing is welded out on the final tick).
-const int   R1_COLLAPSE_GAP = 20;
+const int   R1_COLLAPSE_GAP = 5;
 
 // Auto-tighten
 const float TENSION_SETTLED = 0.6f;
@@ -355,6 +383,13 @@ struct LoopModel {
     // Inert (no geometric change) whenever r3Active is false.
     Vector2 r3Center{ 0.0f, 0.0f };
     bool    r3Active = false;
+    // Boundary of the trigon face being flipped: corners + arc beads, in cycle
+    // order (V0, arc0, V1, arc1, V2, arc2), captured when the walk starts.
+    // KeepOutOfTrigon uses it to hold the outer strands out of the region.
+    std::vector<int> r3Ring;
+    // Debug: beads ejected by the most recent KeepOutOfTrigon pass, for the F3
+    // overlay. Refilled every substep while r3Active; read only by DrawR3Debug.
+    std::vector<int> r3Ejected;
 
     int Through(int vertexBead, int fromBead) const {
         const Bead& v = beads[vertexBead];
@@ -420,6 +455,7 @@ struct LoopModel {
     void TraverseTConnection(int T, int A);
     void MergeTConnections(int T1, int T2);   // fuse two adjacent T-junctions back into one crossing
     void ApplyStemNormalForces(Vector2 center, float k);  // Option 3b: hold each T-junction stem on the bar normal (per substep)
+    void KeepOutOfTrigon(float margin);                   // push non-boundary beads out of the R3 trigon face (per substep)
     void RebuildCrossingList();               // crossingBead = every active vertex (call after R3 surgery)
     void Perform_R3_Walk_S3(int V0, int V1, int V2, FaceClass& f, std::function<void(int, std::function<void()>)> schedule);
     void Perform_R3_Walk_S1(int V, int S1, int S2, std::vector<int>& arc_b1, std::vector<int>& arc_b2,
@@ -448,6 +484,7 @@ LoopModel BuildLoopFromPolygon(const std::vector<Vector2>& gridPoints,
     const std::vector<std::pair<int, int>>& pinCells);
 
 void Draw_Debug_Screen(const LoopModel& m);
+void DrawR3Debug(const LoopModel& m);   // F3 overlay: trigon outline, centroid, ejected beads
 void DrawWireSpline(const LoopModel& model);
 void DrawPins(const LoopModel& model);
 void DrawInterface(float tension, bool autoRunning);

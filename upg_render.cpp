@@ -143,10 +143,48 @@ void DrawWireSpline(const LoopModel& m) {
     }
 }
 
+// DrawR3Debug: F3 overlay for the R3 trigon-containment pass. Draws the trigon
+// boundary (the r3Ring loop), the centroid r3Center used to pick the outward
+// side, and highlights every bead the last KeepOutOfTrigon pass pushed out of
+// the region. Inert unless an R3 walk is live. Purely diagnostic; no state change.
+void DrawR3Debug(const LoopModel& m) {
+    if (!m.r3Active || m.r3Ring.size() < 3) return;
+
+    // Trigon boundary polygon from the live positions of the active ring beads.
+    std::vector<Vector2> poly;
+    poly.reserve(m.r3Ring.size());
+    for (int b : m.r3Ring)
+        if (b >= 0 && b < (int)m.beads.size() && m.beads[b].active)
+            poly.push_back(m.beads[b].pos);
+    if (poly.size() < 3) return;
+
+    // Outline the region (closed loop) and mark each ring bead.
+    for (size_t i = 0; i < poly.size(); ++i) {
+        DrawLineEx(poly[i], poly[(i + 1) % poly.size()], 2.0f, LIME);
+        DrawCircleV(poly[i], 3.0f, DARKGREEN);
+    }
+
+    // Centroid crosshair (the outward-direction reference).
+    DrawCircleV(m.r3Center, 4.0f, SKYBLUE);
+    DrawLineEx({ m.r3Center.x - 9, m.r3Center.y }, { m.r3Center.x + 9, m.r3Center.y }, 1.5f, SKYBLUE);
+    DrawLineEx({ m.r3Center.x, m.r3Center.y - 9 }, { m.r3Center.x, m.r3Center.y + 9 }, 1.5f, SKYBLUE);
+
+    // Beads the last containment pass ejected: filled disc + a faint tick back
+    // toward the centroid, so the push direction is visible.
+    for (int b : m.r3Ejected) {
+        if (b < 0 || b >= (int)m.beads.size() || !m.beads[b].active) continue;
+        Vector2 p = m.beads[b].pos;
+        DrawCircleV(p, RADIUS * 0.6f, ORANGE);
+        DrawLineEx(p, m.r3Center, 1.0f, Fade(ORANGE, 0.35f));
+    }
+
+    DrawText("R3 debug (F3)", 10, 10, 16, LIME);
+}
+
 void DrawPins(const LoopModel& m) {
     for (auto& p : m.pins) {
         if (!p.active) continue;
-        DrawCircleV(p.pos, RADIUS*0.75, RED);
+        DrawCircleV(p.pos, RADIUS * 0.75, RED);
         //DrawCircleLines((int)p.pos.x, (int)p.pos.y, RADIUS, RED);
         std::string lbl = std::to_string(p.id);
         DrawText(lbl.c_str(), (int)(p.pos.x - MeasureText(lbl.c_str(), 10) / 2.0f),
@@ -165,4 +203,4 @@ void DrawInterface(float tension, bool autoRunning) {
 
     const char* hint = "Click pin: R1/R2 remove, or R3 flip (3-crossing face)  |  Drag: move bead  |  Button: auto-tighten";
     DrawText(hint, SCREEN_WIDTH / 2 - MeasureText(hint, 11) / 2, SCREEN_HEIGHT - 20, 11, GRAY);
-}
+}
